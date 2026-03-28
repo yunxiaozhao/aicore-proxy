@@ -265,7 +265,11 @@ def messages():
 
     # Success response
     if is_stream:
-        return Response(_inject_sse_events(sap_resp), status=200, content_type="text/event-stream")
+        return Response(_inject_sse_events(sap_resp), status=200, headers={
+            "Content-Type": "text/event-stream",
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",
+        })
 
     return Response(sap_resp.content, status=200,
                     content_type=sap_resp.headers.get("Content-Type", "application/json"))
