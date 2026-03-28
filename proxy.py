@@ -39,9 +39,9 @@ VERBOSE = os.environ.get("VERBOSE", "false").lower() in ("true", "1", "yes")
 # ---------------------------------------------------------------------------
 # OAuth2 Token Management
 #
-# - 后台守护线程自动刷新 token，在过期前 5 分钟续期
-# - 如果线程还没拿到 token，请求线程会同步获取一次
-# - 刷新失败时指数退避重试（30s → 60s → … → 300s）
+# - A background daemon thread auto-refreshes the token 5 minutes before expiry
+# - If the thread hasn't obtained a token yet, the request thread fetches one synchronously
+# - On refresh failure, retries with exponential backoff (30s -> 60s -> ... -> 300s cap)
 # ---------------------------------------------------------------------------
 _token = None
 _token_expires = 0
@@ -52,10 +52,11 @@ _last_token_error = None
 
 
 def _fetch_token():
-    """向 SAP XSUAA 请求 OAuth2 access_token (client_credentials 模式)。
+    """Request an OAuth2 access_token from SAP XSUAA (client_credentials grant).
 
-    成功后将 token 和过期时间写入全局变量；
-    过期时间提前 300s，确保在真正失效前完成刷新。
+    On success, stores the token and expiry time in global variables.
+    Expiry is set 300s early to ensure refresh completes before actual expiration.
+    Returns the new token string.
     """
     global _token, _token_expires, _last_token_error
     resp = req_lib.post(
@@ -66,18 +67,20 @@ def _fetch_token():
     resp.raise_for_status()
     data = resp.json()
     expires_in = data.get("expires_in", 43200)
+    new_token = data["access_token"]
     with _token_lock:
-        _token = data["access_token"]
+        _token = new_token
         _token_expires = time.time() + expires_in - 300
         _last_token_error = None
     print(f"[proxy] Token refreshed, expires in {expires_in}s", flush=True)
+    return new_token
 
 
 def _refresh_loop():
-    """后台守护线程主循环：周期性刷新 token。
+    """Background daemon thread loop: periodically refreshes the token.
 
-    正常流程：拿到 token → 睡眠到快过期 → 再次刷新。
-    异常流程：指数退避重试（30s / 60s / 120s / 300s 上限）。
+    Normal flow: obtain token -> sleep until near expiry -> refresh again.
+    Error flow: exponential backoff retry (30s / 60s / 120s / 300s cap).
     """
     global _last_token_error
     retry_delay = 30
@@ -98,7 +101,7 @@ def _refresh_loop():
 
 
 def _ensure_refresh_thread():
-    """确保 token 刷新守护线程已启动（仅启动一次）。"""
+    """Ensure the token refresh daemon thread is started (only once)."""
     global _refresh_started
     with _refresh_lock:
         if not _refresh_started:
@@ -108,14 +111,16 @@ def _ensure_refresh_thread():
 
 
 def _get_token():
-    """获取当前有效的 access_token。
+    """Get the current valid access_token.
 
-    1. 确保后台刷新线程已启动
-    2. 如果 token 为空或已过期，同步阻塞获取一次
-    3. 返回 token（可能为 None，调用方需处理）
+    1. Ensure the background refresh thread is started
+    2. If token is None or expired, fetch one synchronously (blocking)
+    3. Return the token (may be None; caller must handle this)
     """
     _ensure_refresh_thread()
-    if _token is None or time.time() > _token_expires:
+    with _token_lock:
+        token, expires = _token, _token_expires
+    if token is None or time.time() > expires:
         try:
             _fetch_token()
         except Exception as e:
@@ -128,70 +133,73 @@ def _get_token():
 
 
 def _forward_to_sap(headers, body, stream):
-    """将请求转发到 SAP AI Core，遇 401 自动刷新 token 重试一次。
+    """Forward the request to SAP AI Core; auto-retry once on 401 after refreshing the token.
 
     Args:
-        headers: 转发请求头（含 Authorization）
-        body:    请求体 dict
-        stream:  是否使用流式传输
+        headers: Request headers (including Authorization)
+        body:    Request body dict
+        stream:  Whether to use streaming
 
     Returns:
-        requests.Response 对象
+        requests.Response object
 
     Raises:
-        req_lib.Timeout: 上游超时
-        req_lib.RequestException: 其他网络错误
+        req_lib.Timeout: Upstream timeout
+        req_lib.RequestException: Other network errors
     """
     subpath = "invoke-with-response-stream" if stream else "invoke"
     target_url = f"{AI_API_URL}/v2/inference/deployments/{DEPLOYMENT_ID}/{subpath}"
     sap_resp = req_lib.post(target_url, headers=headers, json=body, stream=stream, timeout=300)
     if sap_resp.status_code == 401:
-        _fetch_token()
-        with _token_lock:
-            headers["Authorization"] = f"Bearer {_token}"
+        new_token = _fetch_token()
+        headers["Authorization"] = f"Bearer {new_token}"
         sap_resp = req_lib.post(target_url, headers=headers, json=body, stream=stream, timeout=300)
     return sap_resp
 
 
 def _inject_sse_events(sap_resp):
-    """将 SAP/Bedrock 的 SSE 流转换为 Anthropic 标准 SSE 格式。
+    """Convert SAP/Bedrock SSE stream to standard Anthropic SSE format.
 
-    SAP 返回:   data: {"type":"message_start",...}\\n\\n
-    Anthropic:  event: message_start\\ndata: {"type":"message_start",...}\\n\\n
+    SAP returns:   data: {"type":"message_start",...}\\n\\n
+    Anthropic:     event: message_start\\ndata: {"type":"message_start",...}\\n\\n
 
-    逐行读取上游 SSE，为每个 data: 行前插入对应的 event: 行。
+    Reads upstream SSE line by line, injecting an event: line before each data: line.
+    Ensures the upstream response is closed when the generator exits (client disconnect, etc.).
     """
-    for raw_line in sap_resp.iter_lines():
-        line = raw_line.decode("utf-8", errors="replace") if isinstance(raw_line, bytes) else raw_line
-        if line.startswith("data: "):
-            try:
-                payload = json.loads(line[6:])
-                event_type = payload.get("type", "")
-            except (json.JSONDecodeError, ValueError):
-                event_type = ""
-            if event_type:
-                yield f"event: {event_type}\n{line}\n\n".encode("utf-8")
-            else:
-                yield f"{line}\n\n".encode("utf-8")
-        elif line.strip():
-            yield f"{line}\n".encode("utf-8")
+    try:
+        for raw_line in sap_resp.iter_lines():
+            line = raw_line.decode("utf-8", errors="replace") if isinstance(raw_line, bytes) else raw_line
+            if line.startswith("data: "):
+                try:
+                    payload = json.loads(line[6:])
+                    event_type = payload.get("type", "")
+                except (json.JSONDecodeError, ValueError):
+                    event_type = ""
+                if event_type:
+                    yield f"event: {event_type}\n{line}\n\n".encode("utf-8")
+                else:
+                    yield f"{line}\n\n".encode("utf-8")
+            elif line.strip():
+                yield f"{line}\n".encode("utf-8")
+    finally:
+        sap_resp.close()
 
 
 def _adapt_body(body):
-    """适配 Anthropic 请求体为 SAP AI Core 兼容格式。
+    """Adapt Anthropic request body to SAP AI Core compatible format.
 
-    返回 (body, is_stream)。就地修改 body dict。
+    Returns (body, is_stream). Modifies body dict in place.
     """
     if "anthropic_version" not in body:
         body["anthropic_version"] = "bedrock-2023-05-31"
 
-    # SAP AI Core 不接受以下字段
+    # SAP AI Core does not accept these fields
     body.pop("model", None)
     is_stream = body.pop("stream", False)
     body.pop("context_management", None)
 
-    # Bedrock 不支持 Anthropic 内置工具（web_search_20250305、text_editor_20250124 等），
-    # 只保留标准自定义工具（type 为 "custom" 或无 type 字段）
+    # Bedrock does not support Anthropic built-in tools (web_search_20250305, text_editor_20250124, etc.);
+    # keep only standard custom tools (type is "custom" or absent)
     if "tools" in body:
         body["tools"] = [t for t in body["tools"]
                          if t.get("type", "custom") == "custom"]
@@ -210,13 +218,13 @@ app = Flask(__name__)
 
 @app.route("/v1/messages", methods=["POST"])
 def messages():
-    """核心代理端点：接收 Anthropic Messages API 请求，转发至 SAP AI Core。
+    """Main proxy endpoint: receive Anthropic Messages API requests, forward to SAP AI Core.
 
-    处理流程：
-    1. 获取 OAuth2 token
-    2. 校验并适配请求体（移除不支持的字段、过滤内置工具）
-    3. 转发到 SAP AI Core（streaming 走 /invoke-with-response-stream，否则走 /invoke）
-    4. 流式请求注入 SSE event 行后透传；非流式返回完整 JSON
+    Flow:
+    1. Obtain OAuth2 token
+    2. Validate and adapt request body (remove unsupported fields, filter built-in tools)
+    3. Forward to SAP AI Core (streaming via /invoke-with-response-stream, otherwise /invoke)
+    4. For streaming: inject SSE event lines and pass through; for non-streaming: return full JSON
     """
     token = _get_token()
     if not token:
@@ -248,14 +256,14 @@ def messages():
     if VERBOSE:
         print(f"[proxy] <<< status: {sap_resp.status_code}", flush=True)
 
-    # 非 200 统一记录错误（无论 VERBOSE 是否开启都打印，方便调试）
+    # Always log non-200 errors regardless of VERBOSE setting for easier debugging
     if sap_resp.status_code != 200:
         error_body = sap_resp.content.decode("utf-8", errors="replace")
         print(f"[proxy] <<< {sap_resp.status_code} error: {error_body[:2000]}", flush=True)
         return Response(sap_resp.content, status=sap_resp.status_code,
                         content_type=sap_resp.headers.get("Content-Type", "application/json"))
 
-    # 成功响应
+    # Success response
     if is_stream:
         return Response(_inject_sse_events(sap_resp), status=200, content_type="text/event-stream")
 
@@ -265,7 +273,7 @@ def messages():
 
 @app.route("/health", methods=["GET"])
 def health():
-    """健康检查端点，返回 token 状态，供 Docker healthcheck 和监控使用。"""
+    """Health check endpoint. Returns token status for Docker healthcheck and monitoring."""
     token = _get_token()
     with _token_lock:
         token_error = _last_token_error
