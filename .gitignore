@@ -2,3 +2,4 @@ __pycache__/
 .claude/
 docker-compose.yml
 *.pyc
+.DS_Store
