@@ -33,7 +33,40 @@ SAP AI Core (Claude model)
 - SAP AI Core service key credentials (client ID, client secret, auth URL, API URL)
 - Docker
 
-### 2. Configure
+### 2. Get SAP AI Core Credentials
+
+The credentials come from a **service key** of your SAP AI Core instance on BTP:
+
+1. Go to **BTP Cockpit** → your subaccount → **Instances and Subscriptions**
+2. Find your **AI Core** service instance → click **Create Service Key** (or view an existing one)
+3. The service key JSON contains the values you need:
+
+| Service Key Field | Environment Variable |
+|---|---|
+| `clientid` | `SAP_CLIENT_ID` |
+| `clientsecret` | `SAP_CLIENT_SECRET` |
+| `url` | `SAP_AUTH_URL` |
+| `serviceurls.AI_API_URL` | `SAP_AI_API_URL` |
+
+### 3. Find Your Deployment ID
+
+The `SAP_DEPLOYMENT_ID` identifies which model deployment to route requests to. You can list all deployments via the SAP AI Core API:
+
+```bash
+# Get an OAuth token
+TOKEN=$(curl -s -X POST "$SAP_AUTH_URL/oauth/token" \
+  -u "$SAP_CLIENT_ID:$SAP_CLIENT_SECRET" \
+  -d "grant_type=client_credentials" | python3 -c "import sys,json; print(json.load(sys.stdin)['access_token'])")
+
+# List all deployments
+curl -s "$SAP_AI_API_URL/v2/lm/deployments" \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "AI-Resource-Group: $SAP_RESOURCE_GROUP" | python3 -m json.tool
+```
+
+Look for the deployment with the desired model (e.g. `anthropic--claude-4.6-opus`) and `"status": "RUNNING"`, then copy its `id` field.
+
+### 4. Configure
 
 ```bash
 cp docker-compose.example.yml docker-compose.yml
@@ -47,11 +80,11 @@ Edit `docker-compose.yml` and fill in your SAP AI Core credentials:
 | `SAP_CLIENT_SECRET` | OAuth2 client secret from service key |
 | `SAP_AUTH_URL` | XSUAA token endpoint base URL |
 | `SAP_AI_API_URL` | SAP AI Core API base URL |
-| `SAP_DEPLOYMENT_ID` | Your Claude model deployment ID |
+| `SAP_DEPLOYMENT_ID` | Deployment ID of your Claude model (see above) |
 | `SAP_RESOURCE_GROUP` | Resource group (default: `default`) |
 | `VERBOSE` | Enable detailed request/response logging (default: `false`) |
 
-### 3. Run
+### 5. Run
 
 ```bash
 docker compose up -d
@@ -59,7 +92,7 @@ docker compose up -d
 
 The proxy listens on port **6655**.
 
-### 4. Use with Claude Code
+### 6. Use with Claude Code
 
 ```bash
 # Set the API base URL to point to your proxy
@@ -69,7 +102,7 @@ export ANTHROPIC_API_KEY=dummy  # any non-empty value works
 claude
 ```
 
-### 5. Use with Anthropic SDK
+### 7. Use with Anthropic SDK
 
 ```python
 import anthropic
