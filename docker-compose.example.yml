@@ -1,0 +1,18 @@
+services:
+  aicore-proxy:
+    image: yunxiaozhao/aicore-proxy:latest
+    network_mode: host
+    environment:
+      - SAP_CLIENT_ID=<your-client-id>
+      - SAP_CLIENT_SECRET=<your-client-secret>
+      - SAP_AUTH_URL=https://<your-subdomain>.authentication.<region>.hana.ondemand.com
+      - SAP_AI_API_URL=https://api.ai.prod.<region>.aws.ml.hana.ondemand.com
+      - SAP_DEPLOYMENT_ID=<your-deployment-id>
+      - SAP_RESOURCE_GROUP=default
+      - VERBOSE=false
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:6655/health')"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    restart: unless-stopped
