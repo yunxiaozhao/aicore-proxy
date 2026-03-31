@@ -23,6 +23,8 @@ import json
 import time
 import threading
 import requests as req_lib
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 from flask import Flask, request, Response, jsonify
 
 # ---------------------------------------------------------------------------
@@ -50,6 +52,17 @@ _refresh_started = False
 _refresh_lock = threading.Lock()
 _last_token_error = None
 
+# Retry-enabled session for token requests to handle transient SSL/timeout errors
+_auth_session = req_lib.Session()
+_auth_retry = Retry(
+    total=3,
+    backoff_factor=2,           # waits 0s, 2s, 4s between retries
+    status_forcelist=[502, 503, 504],
+    allowed_methods=["POST"],
+)
+_auth_session.mount("https://", HTTPAdapter(max_retries=_auth_retry))
+_auth_session.mount("http://", HTTPAdapter(max_retries=_auth_retry))
+
 
 def _fetch_token():
     """Request an OAuth2 access_token from SAP XSUAA (client_credentials grant).
@@ -57,12 +70,13 @@ def _fetch_token():
     On success, stores the token and expiry time in global variables.
     Expiry is set 300s early to ensure refresh completes before actual expiration.
     Returns the new token string.
+    Uses a retry-enabled session to handle transient SSL/timeout errors.
     """
     global _token, _token_expires, _last_token_error
-    resp = req_lib.post(
+    resp = _auth_session.post(
         f"{AUTH_URL}/oauth/token?grant_type=client_credentials",
         auth=(CLIENT_ID, CLIENT_SECRET),
-        timeout=30,
+        timeout=60,
     )
     resp.raise_for_status()
     data = resp.json()
@@ -185,6 +199,22 @@ def _inject_sse_events(sap_resp):
         sap_resp.close()
 
 
+def _strip_cache_control(obj):
+    """Recursively strip cache_control fields from dicts/lists.
+
+    SAP AI Core / Bedrock does not support Anthropic's prompt caching extensions.
+    VS Code Claude extension sends cache_control with extra fields (e.g. scope)
+    that cause 400 errors.
+    """
+    if isinstance(obj, dict):
+        obj.pop("cache_control", None)
+        for v in obj.values():
+            _strip_cache_control(v)
+    elif isinstance(obj, list):
+        for item in obj:
+            _strip_cache_control(item)
+
+
 def _adapt_body(body):
     """Adapt Anthropic request body to SAP AI Core compatible format.
 
@@ -197,6 +227,11 @@ def _adapt_body(body):
     body.pop("model", None)
     is_stream = body.pop("stream", False)
     body.pop("context_management", None)
+
+    # Strip cache_control from system/messages/tools — unsupported by SAP AI Core
+    for key in ("system", "messages", "tools"):
+        if key in body:
+            _strip_cache_control(body[key])
 
     # Bedrock does not support Anthropic built-in tools (web_search_20250305, text_editor_20250124, etc.);
     # keep only standard custom tools (type is "custom" or absent)
