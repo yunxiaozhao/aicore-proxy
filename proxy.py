@@ -21,6 +21,7 @@ Architecture:
 import os
 import json
 import time
+import itertools
 import threading
 import requests as req_lib
 from requests.adapters import HTTPAdapter
@@ -34,9 +35,24 @@ CLIENT_ID = os.environ["SAP_CLIENT_ID"]
 CLIENT_SECRET = os.environ["SAP_CLIENT_SECRET"]
 AUTH_URL = os.environ["SAP_AUTH_URL"]         # XSUAA token endpoint base URL
 AI_API_URL = os.environ["SAP_AI_API_URL"]     # SAP AI Core API base URL
-DEPLOYMENT_ID = os.environ["SAP_DEPLOYMENT_ID"]
+DEPLOYMENT_IDS = [d.strip() for d in os.environ["SAP_DEPLOYMENT_ID"].split(",") if d.strip()]
+if not DEPLOYMENT_IDS:
+    raise ValueError("SAP_DEPLOYMENT_ID must contain at least one deployment ID")
 RESOURCE_GROUP = os.environ.get("SAP_RESOURCE_GROUP", "default")
 VERBOSE = os.environ.get("VERBOSE", "false").lower() in ("true", "1", "yes")
+
+print(f"[proxy] Configured {len(DEPLOYMENT_IDS)} deployment(s): {DEPLOYMENT_IDS}", flush=True)
+
+# Round-robin deployment selector (thread-safe)
+_deployment_cycle = itertools.cycle(DEPLOYMENT_IDS)
+_deployment_lock = threading.Lock()
+
+
+def _next_deployment():
+    """Return the next deployment ID in round-robin order (thread-safe)."""
+    with _deployment_lock:
+        return next(_deployment_cycle)
+
 
 # ---------------------------------------------------------------------------
 # OAuth2 Token Management
@@ -161,8 +177,11 @@ def _forward_to_sap(headers, body, stream):
         req_lib.Timeout: Upstream timeout
         req_lib.RequestException: Other network errors
     """
+    deployment_id = _next_deployment()
     subpath = "invoke-with-response-stream" if stream else "invoke"
-    target_url = f"{AI_API_URL}/v2/inference/deployments/{DEPLOYMENT_ID}/{subpath}"
+    target_url = f"{AI_API_URL}/v2/inference/deployments/{deployment_id}/{subpath}"
+    if VERBOSE:
+        print(f"[proxy] -> deployment: {deployment_id}", flush=True)
     sap_resp = req_lib.post(target_url, headers=headers, json=body, stream=stream, timeout=300)
     if sap_resp.status_code == 401:
         new_token = _fetch_token()
@@ -316,7 +335,12 @@ def health():
     token = _get_token()
     with _token_lock:
         token_error = _last_token_error
-    return jsonify({"status": "ok", "has_token": token is not None, "token_error": token_error})
+    return jsonify({
+        "status": "ok",
+        "has_token": token is not None,
+        "token_error": token_error,
+        "deployments": len(DEPLOYMENT_IDS),
+    })
 
 
 if __name__ == "__main__":

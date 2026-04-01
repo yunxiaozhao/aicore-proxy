@@ -23,6 +23,7 @@ SAP AI Core (Claude model)
 - **Request adaptation** — automatically handles field differences between Anthropic API and SAP AI Core (removes `model`, `stream`, `context_management`; adds `anthropic_version`)
 - **Built-in tool filtering** — strips Anthropic server-side tools (`web_search`, `text_editor`, etc.) that SAP AI Core doesn't support
 - **401 auto-retry** — transparently refreshes token and retries on authentication failure
+- **Multi-deployment round-robin** — distribute requests across multiple SAP AI Core deployments for load balancing; configure via comma-separated `SAP_DEPLOYMENT_ID`
 - **Health check endpoint** — `GET /health` for Docker healthcheck and monitoring
 
 ## Quick Start
@@ -80,7 +81,7 @@ Edit `docker-compose.yml` and fill in your SAP AI Core credentials:
 | `SAP_CLIENT_SECRET` | OAuth2 client secret from service key |
 | `SAP_AUTH_URL` | XSUAA token endpoint base URL |
 | `SAP_AI_API_URL` | SAP AI Core API base URL |
-| `SAP_DEPLOYMENT_ID` | Deployment ID of your Claude model (see above) |
+| `SAP_DEPLOYMENT_ID` | Deployment ID(s), comma-separated for round-robin load balancing |
 | `SAP_RESOURCE_GROUP` | Resource group (default: `default`) |
 | `VERBOSE` | Enable detailed request/response logging (default: `false`) |
 
@@ -138,7 +139,7 @@ docker build -t aicore-proxy .
 ## Limitations
 
 - **No web search** — Anthropic's built-in server-side tools (`web_search`, `text_editor`) are not supported by SAP AI Core / Bedrock. The proxy silently filters them out.
-- **Single deployment** — all requests are routed to one deployment ID. To use multiple models, run multiple proxy instances.
+- **Round-robin only** — multiple deployments are selected in simple round-robin order; there is no health-aware routing or failover between deployments.
 
 ## License
 
