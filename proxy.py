@@ -79,6 +79,12 @@ _auth_retry = Retry(
 _auth_session.mount("https://", HTTPAdapter(max_retries=_auth_retry))
 _auth_session.mount("http://", HTTPAdapter(max_retries=_auth_retry))
 
+# Connection-pooled session for upstream API requests (avoids per-request TCP setup)
+_api_session = req_lib.Session()
+_api_adapter = HTTPAdapter(pool_connections=10, pool_maxsize=20)
+_api_session.mount("https://", _api_adapter)
+_api_session.mount("http://", _api_adapter)
+
 
 def _fetch_token():
     """Request an OAuth2 access_token from SAP XSUAA (client_credentials grant).
@@ -152,14 +158,14 @@ def _get_token():
         token, expires = _token, _token_expires
     if token is None or time.time() > expires:
         try:
-            _fetch_token()
+            return _fetch_token()
         except Exception as e:
             with _token_lock:
                 global _last_token_error
                 _last_token_error = str(e)
             print(f"[proxy] Synchronous token fetch error: {e}", flush=True)
-    with _token_lock:
-        return _token
+            return None
+    return token
 
 
 def _forward_to_sap(headers, body, stream):
@@ -182,11 +188,11 @@ def _forward_to_sap(headers, body, stream):
     target_url = f"{AI_API_URL}/v2/inference/deployments/{deployment_id}/{subpath}"
     if VERBOSE:
         print(f"[proxy] -> deployment: {deployment_id}", flush=True)
-    sap_resp = req_lib.post(target_url, headers=headers, json=body, stream=stream, timeout=300)
+    sap_resp = _api_session.post(target_url, headers=headers, json=body, stream=stream, timeout=300)
     if sap_resp.status_code == 401:
         new_token = _fetch_token()
         headers["Authorization"] = f"Bearer {new_token}"
-        sap_resp = req_lib.post(target_url, headers=headers, json=body, stream=stream, timeout=300)
+        sap_resp = _api_session.post(target_url, headers=headers, json=body, stream=stream, timeout=300)
     return sap_resp
 
 
@@ -214,6 +220,10 @@ def _inject_sse_events(sap_resp):
                     yield f"{line}\n\n".encode("utf-8")
             elif line.strip():
                 yield f"{line}\n".encode("utf-8")
+    except req_lib.exceptions.ChunkedEncodingError:
+        print("[proxy] Upstream stream ended prematurely (ChunkedEncodingError)", flush=True)
+    except req_lib.exceptions.ConnectionError as e:
+        print(f"[proxy] Upstream connection lost during streaming: {e}", flush=True)
     finally:
         sap_resp.close()
 
@@ -297,8 +307,10 @@ def messages():
     }
 
     if VERBOSE:
-        print(f"[proxy] >>> stream={is_stream}, body keys: {list(body.keys())}", flush=True)
-        print(f"[proxy] >>> body: {json.dumps(body, ensure_ascii=False, default=str)[:2000]}", flush=True)
+        msg_count = len(body.get("messages", []))
+        tool_count = len(body.get("tools", []))
+        print(f"[proxy] >>> stream={is_stream}, messages={msg_count}, tools={tool_count}, "
+              f"body keys: {list(body.keys())}", flush=True)
 
     try:
         sap_resp = _forward_to_sap(headers, body, stream=is_stream)
@@ -331,13 +343,16 @@ def messages():
 
 @app.route("/health", methods=["GET"])
 def health():
-    """Health check endpoint. Returns token status for Docker healthcheck and monitoring."""
-    token = _get_token()
+    """Health check endpoint. Returns token status for Docker healthcheck and monitoring.
+
+    Read-only: does NOT trigger token refresh to avoid side-effects from periodic healthchecks.
+    """
     with _token_lock:
+        has_token = _token is not None
         token_error = _last_token_error
     return jsonify({
         "status": "ok",
-        "has_token": token is not None,
+        "has_token": has_token,
         "token_error": token_error,
         "deployments": len(DEPLOYMENT_IDS),
     })
