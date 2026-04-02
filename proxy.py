@@ -220,10 +220,20 @@ def _inject_sse_events(sap_resp):
                     yield f"{line}\n\n".encode("utf-8")
             elif line.strip():
                 yield f"{line}\n".encode("utf-8")
-    except req_lib.exceptions.ChunkedEncodingError:
-        print("[proxy] Upstream stream ended prematurely (ChunkedEncodingError)", flush=True)
+    except req_lib.exceptions.ChunkedEncodingError as e:
+        print(f"[proxy] Upstream stream ended prematurely (ChunkedEncodingError): {e}", flush=True)
+        err_payload = json.dumps({
+            "type": "error",
+            "error": {"type": "overloaded_error", "message": "Upstream stream ended prematurely"},
+        })
+        yield f"event: error\ndata: {err_payload}\n\n".encode("utf-8")
     except req_lib.exceptions.ConnectionError as e:
         print(f"[proxy] Upstream connection lost during streaming: {e}", flush=True)
+        err_payload = json.dumps({
+            "type": "error",
+            "error": {"type": "overloaded_error", "message": f"Upstream connection lost: {e}"},
+        })
+        yield f"event: error\ndata: {err_payload}\n\n".encode("utf-8")
     finally:
         sap_resp.close()
 
@@ -337,7 +347,29 @@ def messages():
             "X-Accel-Buffering": "no",
         })
 
-    return Response(sap_resp.content, status=200,
+    # Non-streaming: read full response body; retry once on truncated chunked transfer
+    for attempt in range(2):
+        try:
+            content = sap_resp.content
+            break
+        except req_lib.exceptions.ChunkedEncodingError as e:
+            print(f"[proxy] Non-streaming response truncated (attempt {attempt + 1}): {e}", flush=True)
+            sap_resp.close()
+            if attempt == 0:
+                try:
+                    sap_resp = _forward_to_sap(headers, body, stream=False)
+                except req_lib.Timeout:
+                    return jsonify({"error": "Upstream SAP AI Core timeout on retry"}), 504
+                except req_lib.RequestException as e2:
+                    return jsonify({"error": f"Upstream retry failed: {e2}"}), 502
+                if sap_resp.status_code != 200:
+                    err_body = sap_resp.content.decode("utf-8", errors="replace")
+                    print(f"[proxy] <<< {sap_resp.status_code} error on retry: {err_body[:2000]}", flush=True)
+                    return Response(sap_resp.content, status=sap_resp.status_code,
+                                    content_type=sap_resp.headers.get("Content-Type", "application/json"))
+            else:
+                return jsonify({"error": "Upstream response truncated after retry"}), 502
+    return Response(content, status=200,
                     content_type=sap_resp.headers.get("Content-Type", "application/json"))
 
 
