@@ -235,10 +235,20 @@ def inject_sse_events(sap_resp, deployment_id, client_key="", req_start=None):
                     yield f"{line}\n\n".encode("utf-8")
             elif line.strip():
                 yield f"{line}\n".encode("utf-8")
-    except req_lib.exceptions.ChunkedEncodingError:
-        print("[proxy] Upstream stream ended prematurely (ChunkedEncodingError)", flush=True)
+    except req_lib.exceptions.ChunkedEncodingError as e:
+        print(f"[proxy] Upstream stream ended prematurely (ChunkedEncodingError): {e}", flush=True)
+        err_payload = json.dumps({
+            "type": "error",
+            "error": {"type": "overloaded_error", "message": "Upstream stream ended prematurely"},
+        })
+        yield f"event: error\ndata: {err_payload}\n\n".encode("utf-8")
     except req_lib.exceptions.ConnectionError as e:
         print(f"[proxy] Upstream connection lost during streaming: {e}", flush=True)
+        err_payload = json.dumps({
+            "type": "error",
+            "error": {"type": "overloaded_error", "message": f"Upstream connection lost: {e}"},
+        })
+        yield f"event: error\ndata: {err_payload}\n\n".encode("utf-8")
     finally:
         sap_resp.close()
         _release_deployment(deployment_id)

@@ -97,19 +97,51 @@ def messages():
                 "X-Accel-Buffering": "no",
             })
 
-    # Success: non-streaming — extract usage from response
+    # Success: non-streaming — retry once on truncated chunked transfer
+    for attempt in range(2):
+        try:
+            content = sap_resp.content
+            break
+        except req_lib.exceptions.ChunkedEncodingError as e:
+            print(f"[proxy] Non-streaming response truncated (attempt {attempt + 1}): {e}", flush=True)
+            sap_resp.close()
+            if attempt == 0:
+                try:
+                    sap_resp, dep_id2 = forward_to_sap(headers, body, stream=False)
+                except req_lib.Timeout:
+                    release_deployment(dep_id)
+                    log_usage(client_key, dep_id, 0, 0, 504, False, int((time.time() - req_start) * 1000))
+                    return jsonify({"error": "Upstream SAP AI Core timeout on retry"}), 504
+                except req_lib.RequestException as e2:
+                    release_deployment(dep_id)
+                    log_usage(client_key, dep_id, 0, 0, 502, False, int((time.time() - req_start) * 1000))
+                    return jsonify({"error": f"Upstream retry failed: {e2}"}), 502
+                release_deployment(dep_id)
+                dep_id = dep_id2
+                if sap_resp.status_code != 200:
+                    err_body = sap_resp.content.decode("utf-8", errors="replace")
+                    print(f"[proxy] <<< {sap_resp.status_code} error on retry: {err_body[:2000]}", flush=True)
+                    release_deployment(dep_id)
+                    log_usage(client_key, dep_id, 0, 0, sap_resp.status_code, False, int((time.time() - req_start) * 1000))
+                    return Response(sap_resp.content, status=sap_resp.status_code,
+                                    content_type=sap_resp.headers.get("Content-Type", "application/json"))
+            else:
+                release_deployment(dep_id)
+                log_usage(client_key, dep_id, 0, 0, 502, False, int((time.time() - req_start) * 1000))
+                return jsonify({"error": "Upstream response truncated after retry"}), 502
+
     release_deployment(dep_id)
     duration_ms = int((time.time() - req_start) * 1000)
     input_tokens = output_tokens = 0
     try:
-        resp_data = json.loads(sap_resp.content)
+        resp_data = json.loads(content)
         usage = resp_data.get("usage", {})
         input_tokens = usage.get("input_tokens", 0)
         output_tokens = usage.get("output_tokens", 0)
     except (json.JSONDecodeError, AttributeError):
         pass
     log_usage(client_key, dep_id, input_tokens, output_tokens, 200, False, duration_ms)
-    return Response(sap_resp.content, status=200,
+    return Response(content, status=200,
                     content_type=sap_resp.headers.get("Content-Type", "application/json"))
 
 
