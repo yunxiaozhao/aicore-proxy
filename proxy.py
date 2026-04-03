@@ -89,8 +89,11 @@ CLIENT_ID = _cfg("SAP_CLIENT_ID", "sap_client_id")
 CLIENT_SECRET = _cfg("SAP_CLIENT_SECRET", "sap_client_secret")
 AUTH_URL = _cfg("SAP_AUTH_URL", "sap_auth_url")
 AI_API_URL = _cfg("SAP_AI_API_URL", "sap_ai_api_url")
-_dep_str = _cfg("SAP_DEPLOYMENT_ID", "sap_deployment_id", "")
-DEPLOYMENT_IDS = [d.strip() for d in _dep_str.split(",") if d.strip()]
+_dep_raw = _cfg("SAP_DEPLOYMENT_ID", "sap_deployment_id", "")
+if isinstance(_dep_raw, list):
+    DEPLOYMENT_IDS = [d.strip() for d in _dep_raw if isinstance(d, str) and d.strip()]
+else:
+    DEPLOYMENT_IDS = [d.strip() for d in str(_dep_raw).split(",") if d.strip()]
 RESOURCE_GROUP = _cfg("SAP_RESOURCE_GROUP", "sap_resource_group", "default")
 VERBOSE = str(_cfg("VERBOSE", "verbose", "false")).lower() in ("true", "1", "yes")
 ENABLE_STATS = str(_cfg("ENABLE_STATS", "enable_stats", "false")).lower() in ("true", "1", "yes")

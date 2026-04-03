@@ -3,7 +3,7 @@
   "sap_client_secret": "<your-client-secret>",
   "sap_auth_url": "https://<your-subdomain>.authentication.<region>.hana.ondemand.com",
   "sap_ai_api_url": "https://api.ai.prod.<region>.aws.ml.hana.ondemand.com",
-  "sap_deployment_id": "<deployment-id-1>,<deployment-id-2>",
+  "sap_deployment_id": ["<deployment-id-1>", "<deployment-id-2>"],
   "sap_resource_group": "default",
   "verbose": false,
   "api_keys": ["sk-your-key-1", "sk-your-key-2"],
