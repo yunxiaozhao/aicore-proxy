@@ -3,5 +3,6 @@ __pycache__/
 .claude/
 docker-compose.yml
 config.json
+*.db
 *.pyc
 .DS_Store

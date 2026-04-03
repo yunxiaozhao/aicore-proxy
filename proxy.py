@@ -199,7 +199,7 @@ _db = None
 _db_lock = threading.Lock()
 
 if ENABLE_STATS:
-    _db_path = os.environ.get("DB_PATH", "/app/data/proxy.db")
+    _db_path = os.environ.get("DB_PATH", "/etc/aicore-proxy/proxy.db")
     os.makedirs(os.path.dirname(_db_path), exist_ok=True)
     _db = sqlite3.connect(_db_path, check_same_thread=False)
     _db.execute("PRAGMA journal_mode=WAL")

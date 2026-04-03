@@ -15,17 +15,11 @@ services:
       # Optional: enable per-key usage statistics with SQLite
       # - ENABLE_STATS=true
     volumes:
-      # Optional: config file for API keys and settings (hot-reloaded)
+      # Optional: config file, API keys, and SQLite data (hot-reloaded)
       - ./aicore-proxy:/etc/aicore-proxy
-      # Optional: SQLite persistence (only needed with ENABLE_STATS=true)
-      # - proxy-data:/app/data
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:6655/health')"]
       interval: 30s
       timeout: 10s
       retries: 3
     restart: unless-stopped
-
-# Optional: uncomment for SQLite persistence
-# volumes:
-#   proxy-data:
