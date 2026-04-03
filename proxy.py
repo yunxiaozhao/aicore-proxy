@@ -21,7 +21,6 @@ Architecture:
 import os
 import json
 import time
-import itertools
 import threading
 import requests as req_lib
 from requests.adapters import HTTPAdapter
@@ -43,15 +42,27 @@ VERBOSE = os.environ.get("VERBOSE", "false").lower() in ("true", "1", "yes")
 
 print(f"[proxy] Configured {len(DEPLOYMENT_IDS)} deployment(s): {DEPLOYMENT_IDS}", flush=True)
 
-# Round-robin deployment selector (thread-safe)
-_deployment_cycle = itertools.cycle(DEPLOYMENT_IDS)
+# Least-connections deployment selector (thread-safe)
+_deployment_active = {dep_id: 0 for dep_id in DEPLOYMENT_IDS}
 _deployment_lock = threading.Lock()
 
 
 def _next_deployment():
-    """Return the next deployment ID in round-robin order (thread-safe)."""
+    """Pick the deployment with the fewest active requests (least-connections).
+
+    Increments the active count atomically before returning.
+    Caller MUST call _release_deployment() when the request completes.
+    """
     with _deployment_lock:
-        return next(_deployment_cycle)
+        dep = min(DEPLOYMENT_IDS, key=lambda d: _deployment_active[d])
+        _deployment_active[dep] += 1
+        return dep
+
+
+def _release_deployment(dep_id):
+    """Decrement active request count when a request completes."""
+    with _deployment_lock:
+        _deployment_active[dep_id] = max(0, _deployment_active[dep_id] - 1)
 
 
 # ---------------------------------------------------------------------------
@@ -177,7 +188,7 @@ def _forward_to_sap(headers, body, stream):
         stream:  Whether to use streaming
 
     Returns:
-        requests.Response object
+        (requests.Response, deployment_id) tuple
 
     Raises:
         req_lib.Timeout: Upstream timeout
@@ -188,22 +199,26 @@ def _forward_to_sap(headers, body, stream):
     target_url = f"{AI_API_URL}/v2/inference/deployments/{deployment_id}/{subpath}"
     if VERBOSE:
         print(f"[proxy] -> deployment: {deployment_id}", flush=True)
-    sap_resp = _api_session.post(target_url, headers=headers, json=body, stream=stream, timeout=300)
-    if sap_resp.status_code == 401:
-        new_token = _fetch_token()
-        headers["Authorization"] = f"Bearer {new_token}"
+    try:
         sap_resp = _api_session.post(target_url, headers=headers, json=body, stream=stream, timeout=300)
-    return sap_resp
+        if sap_resp.status_code == 401:
+            new_token = _fetch_token()
+            headers["Authorization"] = f"Bearer {new_token}"
+            sap_resp = _api_session.post(target_url, headers=headers, json=body, stream=stream, timeout=300)
+    except Exception:
+        _release_deployment(deployment_id)
+        raise
+    return sap_resp, deployment_id
 
 
-def _inject_sse_events(sap_resp):
+def _inject_sse_events(sap_resp, deployment_id):
     """Convert SAP/Bedrock SSE stream to standard Anthropic SSE format.
 
     SAP returns:   data: {"type":"message_start",...}\\n\\n
     Anthropic:     event: message_start\\ndata: {"type":"message_start",...}\\n\\n
 
     Reads upstream SSE line by line, injecting an event: line before each data: line.
-    Ensures the upstream response is closed when the generator exits (client disconnect, etc.).
+    Ensures the upstream response is closed and deployment released when done.
     """
     try:
         for raw_line in sap_resp.iter_lines():
@@ -226,6 +241,7 @@ def _inject_sse_events(sap_resp):
         print(f"[proxy] Upstream connection lost during streaming: {e}", flush=True)
     finally:
         sap_resp.close()
+        _release_deployment(deployment_id)
 
 
 def _strip_cache_control(obj):
@@ -313,7 +329,7 @@ def messages():
               f"body keys: {list(body.keys())}", flush=True)
 
     try:
-        sap_resp = _forward_to_sap(headers, body, stream=is_stream)
+        sap_resp, dep_id = _forward_to_sap(headers, body, stream=is_stream)
     except req_lib.Timeout:
         return jsonify({"error": "Upstream SAP AI Core timeout"}), 504
     except req_lib.RequestException as e:
@@ -326,17 +342,20 @@ def messages():
     if sap_resp.status_code != 200:
         error_body = sap_resp.content.decode("utf-8", errors="replace")
         print(f"[proxy] <<< {sap_resp.status_code} error: {error_body[:2000]}", flush=True)
+        _release_deployment(dep_id)
         return Response(sap_resp.content, status=sap_resp.status_code,
                         content_type=sap_resp.headers.get("Content-Type", "application/json"))
 
     # Success response
     if is_stream:
-        return Response(_inject_sse_events(sap_resp), status=200, headers={
+        # Deployment released in _inject_sse_events finally block
+        return Response(_inject_sse_events(sap_resp, dep_id), status=200, headers={
             "Content-Type": "text/event-stream",
             "Cache-Control": "no-cache",
             "X-Accel-Buffering": "no",
         })
 
+    _release_deployment(dep_id)
     return Response(sap_resp.content, status=200,
                     content_type=sap_resp.headers.get("Content-Type", "application/json"))
 
