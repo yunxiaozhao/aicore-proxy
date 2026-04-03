@@ -187,6 +187,10 @@ curl http://localhost:6655/admin/usage
 # Filter by key or time range
 curl "http://localhost:6655/admin/usage?key=sk-key1&days=7"
 
+# Group by day
+curl "http://localhost:6655/admin/usage?group_by=day"
+curl "http://localhost:6655/admin/usage?group_by=day&days=7"
+
 # Manage API keys via admin API
 curl -X POST http://localhost:6655/admin/keys -H "Content-Type: application/json" -d '{"name": "dev-team"}'
 curl http://localhost:6655/admin/keys

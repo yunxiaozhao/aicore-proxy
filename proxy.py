@@ -669,12 +669,12 @@ def admin_delete_key(key):
 
 @app.route("/admin/usage", methods=["GET"])
 def admin_usage():
-    """Usage summary. Query params: ?key=xxx, ?days=7."""
+    """Usage summary. Query params: ?key=xxx, ?days=7, ?group_by=day."""
     if not ENABLE_STATS or not _db:
         return jsonify({"error": "Stats not enabled"}), 404
     key_filter = request.args.get("key")
     days = request.args.get("days", type=int)
-    query = "SELECT api_key, COUNT(*) as requests, COALESCE(SUM(input_tokens),0), COALESCE(SUM(output_tokens),0), COALESCE(AVG(duration_ms),0) FROM usage_log"
+    group_by = request.args.get("group_by", "")
     params = []
     conditions = []
     if key_filter:
@@ -683,9 +683,28 @@ def admin_usage():
     if days:
         conditions.append("timestamp >= datetime('now', ?)")
         params.append(f"-{days} days")
-    if conditions:
-        query += " WHERE " + " AND ".join(conditions)
-    query += " GROUP BY api_key ORDER BY requests DESC"
+    where = (" WHERE " + " AND ".join(conditions)) if conditions else ""
+
+    if group_by == "day":
+        query = (
+            f"SELECT DATE(timestamp) as date, api_key, COUNT(*) as requests, "
+            f"COALESCE(SUM(input_tokens),0), COALESCE(SUM(output_tokens),0), "
+            f"COALESCE(AVG(duration_ms),0) FROM usage_log{where} "
+            f"GROUP BY date, api_key ORDER BY date DESC, requests DESC"
+        )
+        with _db_lock:
+            rows = _db.execute(query, params).fetchall()
+        return jsonify([{
+            "date": r[0], "api_key": r[1], "requests": r[2],
+            "input_tokens": r[3], "output_tokens": r[4],
+            "avg_duration_ms": round(r[5]),
+        } for r in rows])
+
+    query = (
+        f"SELECT api_key, COUNT(*) as requests, COALESCE(SUM(input_tokens),0), "
+        f"COALESCE(SUM(output_tokens),0), COALESCE(AVG(duration_ms),0) FROM usage_log{where} "
+        f"GROUP BY api_key ORDER BY requests DESC"
+    )
     with _db_lock:
         rows = _db.execute(query, params).fetchall()
     return jsonify([{
