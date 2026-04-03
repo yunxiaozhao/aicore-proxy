@@ -24,7 +24,11 @@ SAP AI Core (Claude model)
 - **Built-in tool filtering** — strips Anthropic server-side tools (`web_search`, `text_editor`, etc.) that SAP AI Core doesn't support
 - **401 auto-retry** — transparently refreshes token and retries on authentication failure
 - **Least-connections load balancing** — distributes requests across multiple SAP AI Core deployments, routing each request to the deployment with the fewest active connections; ideal for concurrent subagent workloads. Configure via comma-separated `SAP_DEPLOYMENT_ID`
-- **Health check endpoint** — `GET /health` for Docker healthcheck and monitoring
+- **API key authentication** — optional client API key validation via env var, config file, or database; disabled when no keys configured (backward compatible)
+- **Config file support** — settings can be provided via `/etc/aicore-proxy/config.json` (volume-mounted), with env vars taking priority; `api_keys` field is hot-reloaded every 60s
+- **Usage statistics** — optional per-key request and token usage tracking with SQLite (enable via `ENABLE_STATS=true`)
+- **Admin API** — manage API keys and query usage stats via REST endpoints (requires `ENABLE_STATS=true`)
+- **Health check & stats endpoints** — `GET /health` for Docker healthcheck, `GET /stats` for deployment active connections
 
 ## Quick Start
 
@@ -81,9 +85,36 @@ Edit `docker-compose.yml` and fill in your SAP AI Core credentials:
 | `SAP_CLIENT_SECRET` | OAuth2 client secret from service key |
 | `SAP_AUTH_URL` | XSUAA token endpoint base URL |
 | `SAP_AI_API_URL` | SAP AI Core API base URL |
-| `SAP_DEPLOYMENT_ID` | Deployment ID(s), comma-separated for round-robin load balancing |
+| `SAP_DEPLOYMENT_ID` | Deployment ID(s), comma-separated for load balancing |
 | `SAP_RESOURCE_GROUP` | Resource group (default: `default`) |
 | `VERBOSE` | Enable detailed request/response logging (default: `false`) |
+| `API_KEYS` | Optional: comma-separated API keys for client authentication |
+| `ENABLE_STATS` | Optional: enable per-key usage tracking with SQLite (default: `false`) |
+
+All settings can also be provided via a config file (see below).
+
+### Config File (Optional)
+
+Mount a directory to `/etc/aicore-proxy` and create `config.json`:
+
+```bash
+mkdir -p ./aicore-proxy
+cat > ./aicore-proxy/config.json << 'EOF'
+{
+  "sap_client_id": "sb-xxx",
+  "sap_client_secret": "xxx",
+  "sap_auth_url": "https://...",
+  "sap_ai_api_url": "https://...",
+  "sap_deployment_id": "id1,id2",
+  "api_keys": ["sk-key1", "sk-key2"],
+  "enable_stats": true
+}
+EOF
+```
+
+- **Env vars take priority** over config file values
+- The `api_keys` field is **hot-reloaded** every 60s — change keys without restarting
+- All fields are optional — only override what you need
 
 ### 5. Run
 
@@ -128,6 +159,41 @@ with client.messages.stream(
 ) as stream:
     for text in stream.text_stream:
         print(text, end="", flush=True)
+```
+
+## API Key Authentication
+
+When `API_KEYS` is set (env var or config file), clients must provide a valid key:
+
+```bash
+export ANTHROPIC_BASE_URL=http://localhost:6655
+export ANTHROPIC_API_KEY=sk-key1  # must match a configured key
+
+claude
+```
+
+Keys can be provided via `x-api-key` header or `Authorization: Bearer <key>` header.
+
+If no keys are configured, auth is disabled (backward compatible).
+
+## Usage Statistics
+
+Enable with `ENABLE_STATS=true` to track per-key request counts and token usage in SQLite.
+
+```bash
+# View usage summary
+curl http://localhost:6655/admin/usage
+
+# Filter by key or time range
+curl "http://localhost:6655/admin/usage?key=sk-key1&days=7"
+
+# Manage API keys via admin API
+curl -X POST http://localhost:6655/admin/keys -H "Content-Type: application/json" -d '{"name": "dev-team"}'
+curl http://localhost:6655/admin/keys
+curl -X DELETE http://localhost:6655/admin/keys/sk-xxx
+
+# View deployment stats
+curl http://localhost:6655/stats
 ```
 
 ## Build from Source

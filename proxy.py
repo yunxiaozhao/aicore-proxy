@@ -21,24 +21,84 @@ Architecture:
 import os
 import json
 import time
+import sqlite3
+import secrets
 import threading
 import requests as req_lib
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 from flask import Flask, request, Response, jsonify
 
+
 # ---------------------------------------------------------------------------
-# Configuration — from docker-compose.yml environment
+# Config file loading — /etc/aicore-proxy/config.json (optional, volume-mounted)
+# Priority: env var > config file. Config file api_keys hot-reloaded every 60s.
 # ---------------------------------------------------------------------------
-CLIENT_ID = os.environ["SAP_CLIENT_ID"]
-CLIENT_SECRET = os.environ["SAP_CLIENT_SECRET"]
-AUTH_URL = os.environ["SAP_AUTH_URL"]         # XSUAA token endpoint base URL
-AI_API_URL = os.environ["SAP_AI_API_URL"]     # SAP AI Core API base URL
-DEPLOYMENT_IDS = [d.strip() for d in os.environ["SAP_DEPLOYMENT_ID"].split(",") if d.strip()]
+_CONFIG_PATH = os.environ.get("CONFIG_PATH", "/etc/aicore-proxy/config.json")
+_config_file_data = {}
+_config_file_mtime = 0
+_config_file_lock = threading.Lock()
+_config_last_check = 0
+
+
+def _load_config_file():
+    """Load config from JSON file if it exists. Returns cached data if file unchanged."""
+    global _config_file_data, _config_file_mtime, _config_last_check
+    now = time.time()
+    with _config_file_lock:
+        if now - _config_last_check < 60:
+            return _config_file_data
+        _config_last_check = now
+    try:
+        mtime = os.path.getmtime(_CONFIG_PATH)
+        with _config_file_lock:
+            if mtime == _config_file_mtime:
+                return _config_file_data
+        with open(_CONFIG_PATH, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        with _config_file_lock:
+            _config_file_data = data
+            _config_file_mtime = mtime
+        print(f"[proxy] Config file loaded/reloaded: {_CONFIG_PATH}", flush=True)
+        return data
+    except FileNotFoundError:
+        return {}
+    except Exception as e:
+        print(f"[proxy] Config file error: {e}", flush=True)
+        with _config_file_lock:
+            return _config_file_data
+
+
+def _cfg(env_key, config_key=None, default=None):
+    """Get config value: env var takes priority, then config file, then default."""
+    val = os.environ.get(env_key)
+    if val is not None:
+        return val
+    if config_key is None:
+        config_key = env_key.lower()
+    cfg = _load_config_file()
+    return cfg.get(config_key, default)
+
+# ---------------------------------------------------------------------------
+# Configuration — env vars take priority, then config file, then defaults
+# ---------------------------------------------------------------------------
+# Load config file once at startup for non-hot-reloaded fields
+_startup_config = _load_config_file()
+
+CLIENT_ID = _cfg("SAP_CLIENT_ID", "sap_client_id")
+CLIENT_SECRET = _cfg("SAP_CLIENT_SECRET", "sap_client_secret")
+AUTH_URL = _cfg("SAP_AUTH_URL", "sap_auth_url")
+AI_API_URL = _cfg("SAP_AI_API_URL", "sap_ai_api_url")
+_dep_str = _cfg("SAP_DEPLOYMENT_ID", "sap_deployment_id", "")
+DEPLOYMENT_IDS = [d.strip() for d in _dep_str.split(",") if d.strip()]
+RESOURCE_GROUP = _cfg("SAP_RESOURCE_GROUP", "sap_resource_group", "default")
+VERBOSE = str(_cfg("VERBOSE", "verbose", "false")).lower() in ("true", "1", "yes")
+ENABLE_STATS = str(_cfg("ENABLE_STATS", "enable_stats", "false")).lower() in ("true", "1", "yes")
+
+if not CLIENT_ID or not CLIENT_SECRET or not AUTH_URL or not AI_API_URL:
+    raise ValueError("SAP credentials required: set SAP_CLIENT_ID, SAP_CLIENT_SECRET, SAP_AUTH_URL, SAP_AI_API_URL via env vars or config file")
 if not DEPLOYMENT_IDS:
     raise ValueError("SAP_DEPLOYMENT_ID must contain at least one deployment ID")
-RESOURCE_GROUP = os.environ.get("SAP_RESOURCE_GROUP", "default")
-VERBOSE = os.environ.get("VERBOSE", "false").lower() in ("true", "1", "yes")
 
 print(f"[proxy] Configured {len(DEPLOYMENT_IDS)} deployment(s): {DEPLOYMENT_IDS}", flush=True)
 
@@ -63,6 +123,119 @@ def _release_deployment(dep_id):
     """Decrement active request count when a request completes."""
     with _deployment_lock:
         _deployment_active[dep_id] = max(0, _deployment_active[dep_id] - 1)
+
+
+# ---------------------------------------------------------------------------
+# API Key Authentication
+#
+# Keys from three sources (merged): API_KEYS env var, config file, SQLite DB.
+# No keys configured → auth disabled (backward compatible).
+# Config file api_keys hot-reloaded every 60s.
+# ---------------------------------------------------------------------------
+_api_keys_cache = set()
+_api_keys_lock = threading.Lock()
+_api_keys_last_refresh = 0
+
+
+def _refresh_api_keys():
+    """Refresh the merged set of API keys from all sources."""
+    global _api_keys_cache, _api_keys_last_refresh
+    now = time.time()
+    with _api_keys_lock:
+        if now - _api_keys_last_refresh < 60:
+            return
+        _api_keys_last_refresh = now
+
+    keys = set()
+    # Source 1: env var
+    env_keys = os.environ.get("API_KEYS", "")
+    for k in env_keys.split(","):
+        k = k.strip()
+        if k:
+            keys.add(k)
+
+    # Source 2: config file (hot-reloaded)
+    cfg = _load_config_file()
+    for k in cfg.get("api_keys", []):
+        if isinstance(k, str) and k.strip():
+            keys.add(k.strip())
+
+    # Source 3: SQLite DB (if stats enabled)
+    if ENABLE_STATS and _db:
+        try:
+            cur = _db.execute("SELECT key FROM api_keys WHERE enabled = 1")
+            for row in cur.fetchall():
+                keys.add(row[0])
+        except Exception:
+            pass
+
+    with _api_keys_lock:
+        _api_keys_cache = keys
+
+
+def _auth_enabled():
+    """Check if any API keys are configured."""
+    _refresh_api_keys()
+    with _api_keys_lock:
+        return len(_api_keys_cache) > 0
+
+
+def _validate_api_key(key):
+    """Validate an API key against the merged key set."""
+    if not key:
+        return False
+    _refresh_api_keys()
+    with _api_keys_lock:
+        return key in _api_keys_cache
+
+
+# ---------------------------------------------------------------------------
+# SQLite Usage Tracking (opt-in via ENABLE_STATS=true)
+# ---------------------------------------------------------------------------
+_db = None
+_db_lock = threading.Lock()
+
+if ENABLE_STATS:
+    _db_path = os.environ.get("DB_PATH", "/app/data/proxy.db")
+    os.makedirs(os.path.dirname(_db_path), exist_ok=True)
+    _db = sqlite3.connect(_db_path, check_same_thread=False)
+    _db.execute("PRAGMA journal_mode=WAL")
+    _db.execute("""CREATE TABLE IF NOT EXISTS api_keys (
+        key TEXT PRIMARY KEY,
+        name TEXT NOT NULL,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        enabled BOOLEAN DEFAULT 1
+    )""")
+    _db.execute("""CREATE TABLE IF NOT EXISTS usage_log (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        api_key TEXT NOT NULL,
+        timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        deployment_id TEXT,
+        input_tokens INTEGER DEFAULT 0,
+        output_tokens INTEGER DEFAULT 0,
+        status_code INTEGER,
+        stream BOOLEAN,
+        duration_ms INTEGER
+    )""")
+    _db.execute("CREATE INDEX IF NOT EXISTS idx_usage_key_ts ON usage_log(api_key, timestamp)")
+    _db.commit()
+    print(f"[proxy] Stats enabled, SQLite DB: {_db_path}", flush=True)
+
+
+def _log_usage(api_key, deployment_id, input_tokens, output_tokens, status_code, stream, duration_ms):
+    """Log a request to the usage_log table (only when ENABLE_STATS=true)."""
+    if not ENABLE_STATS or not _db:
+        return
+    try:
+        with _db_lock:
+            _db.execute(
+                "INSERT INTO usage_log (api_key, deployment_id, input_tokens, output_tokens, status_code, stream, duration_ms) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (api_key or "anonymous", deployment_id, input_tokens, output_tokens, status_code, stream, duration_ms),
+            )
+            _db.commit()
+    except Exception as e:
+        print(f"[proxy] Usage log error: {e}", flush=True)
 
 
 # ---------------------------------------------------------------------------
@@ -211,15 +384,18 @@ def _forward_to_sap(headers, body, stream):
     return sap_resp, deployment_id
 
 
-def _inject_sse_events(sap_resp, deployment_id):
+def _inject_sse_events(sap_resp, deployment_id, client_key="", req_start=None):
     """Convert SAP/Bedrock SSE stream to standard Anthropic SSE format.
 
     SAP returns:   data: {"type":"message_start",...}\\n\\n
     Anthropic:     event: message_start\\ndata: {"type":"message_start",...}\\n\\n
 
     Reads upstream SSE line by line, injecting an event: line before each data: line.
+    Accumulates token usage from message_start and message_delta events.
     Ensures the upstream response is closed and deployment released when done.
     """
+    input_tokens = 0
+    output_tokens = 0
     try:
         for raw_line in sap_resp.iter_lines():
             line = raw_line.decode("utf-8", errors="replace") if isinstance(raw_line, bytes) else raw_line
@@ -228,7 +404,15 @@ def _inject_sse_events(sap_resp, deployment_id):
                     payload = json.loads(line[6:])
                     event_type = payload.get("type", "")
                 except (json.JSONDecodeError, ValueError):
+                    payload = {}
                     event_type = ""
+                # Accumulate token usage from SSE events
+                if event_type == "message_start":
+                    usage = payload.get("message", {}).get("usage", {})
+                    input_tokens += usage.get("input_tokens", 0)
+                elif event_type == "message_delta":
+                    usage = payload.get("usage", {})
+                    output_tokens += usage.get("output_tokens", 0)
                 if event_type:
                     yield f"event: {event_type}\n{line}\n\n".encode("utf-8")
                 else:
@@ -242,6 +426,8 @@ def _inject_sse_events(sap_resp, deployment_id):
     finally:
         sap_resp.close()
         _release_deployment(deployment_id)
+        duration_ms = int((time.time() - req_start) * 1000) if req_start else 0
+        _log_usage(client_key, deployment_id, input_tokens, output_tokens, 200, True, duration_ms)
 
 
 def _strip_cache_control(obj):
@@ -298,14 +484,16 @@ app = Flask(__name__)
 
 @app.route("/v1/messages", methods=["POST"])
 def messages():
-    """Main proxy endpoint: receive Anthropic Messages API requests, forward to SAP AI Core.
+    """Main proxy endpoint: receive Anthropic Messages API requests, forward to SAP AI Core."""
+    # --- API key authentication ---
+    client_key = request.headers.get("x-api-key") or ""
+    if not client_key:
+        auth_header = request.headers.get("Authorization", "")
+        if auth_header.startswith("Bearer "):
+            client_key = auth_header[7:].strip()
+    if _auth_enabled() and not _validate_api_key(client_key):
+        return jsonify({"type": "error", "error": {"type": "authentication_error", "message": "Invalid API key"}}), 401
 
-    Flow:
-    1. Obtain OAuth2 token
-    2. Validate and adapt request body (remove unsupported fields, filter built-in tools)
-    3. Forward to SAP AI Core (streaming via /invoke-with-response-stream, otherwise /invoke)
-    4. For streaming: inject SSE event lines and pass through; for non-streaming: return full JSON
-    """
     token = _get_token()
     if not token:
         return jsonify({"error": "No SAP token available yet, try again shortly"}), 503
@@ -315,6 +503,7 @@ def messages():
         return jsonify({"error": "Invalid JSON body"}), 400
 
     body, is_stream = _adapt_body(body)
+    req_start = time.time()
 
     headers = {
         "Authorization": f"Bearer {token}",
@@ -331,8 +520,10 @@ def messages():
     try:
         sap_resp, dep_id = _forward_to_sap(headers, body, stream=is_stream)
     except req_lib.Timeout:
+        _log_usage(client_key, None, 0, 0, 504, is_stream, int((time.time() - req_start) * 1000))
         return jsonify({"error": "Upstream SAP AI Core timeout"}), 504
     except req_lib.RequestException as e:
+        _log_usage(client_key, None, 0, 0, 502, is_stream, int((time.time() - req_start) * 1000))
         return jsonify({"error": f"Upstream SAP AI Core request failed: {e}"}), 502
 
     if VERBOSE:
@@ -343,38 +534,162 @@ def messages():
         error_body = sap_resp.content.decode("utf-8", errors="replace")
         print(f"[proxy] <<< {sap_resp.status_code} error: {error_body[:2000]}", flush=True)
         _release_deployment(dep_id)
+        _log_usage(client_key, dep_id, 0, 0, sap_resp.status_code, is_stream, int((time.time() - req_start) * 1000))
         return Response(sap_resp.content, status=sap_resp.status_code,
                         content_type=sap_resp.headers.get("Content-Type", "application/json"))
 
-    # Success response
+    # Success: streaming
     if is_stream:
         # Deployment released in _inject_sse_events finally block
-        return Response(_inject_sse_events(sap_resp, dep_id), status=200, headers={
-            "Content-Type": "text/event-stream",
-            "Cache-Control": "no-cache",
-            "X-Accel-Buffering": "no",
-        })
+        return Response(
+            _inject_sse_events(sap_resp, dep_id, client_key, req_start),
+            status=200, headers={
+                "Content-Type": "text/event-stream",
+                "Cache-Control": "no-cache",
+                "X-Accel-Buffering": "no",
+            })
 
+    # Success: non-streaming — extract usage from response
     _release_deployment(dep_id)
+    duration_ms = int((time.time() - req_start) * 1000)
+    input_tokens = output_tokens = 0
+    try:
+        resp_data = json.loads(sap_resp.content)
+        usage = resp_data.get("usage", {})
+        input_tokens = usage.get("input_tokens", 0)
+        output_tokens = usage.get("output_tokens", 0)
+    except (json.JSONDecodeError, AttributeError):
+        pass
+    _log_usage(client_key, dep_id, input_tokens, output_tokens, 200, False, duration_ms)
     return Response(sap_resp.content, status=200,
                     content_type=sap_resp.headers.get("Content-Type", "application/json"))
 
 
 @app.route("/health", methods=["GET"])
 def health():
-    """Health check endpoint. Returns token status for Docker healthcheck and monitoring.
-
-    Read-only: does NOT trigger token refresh to avoid side-effects from periodic healthchecks.
-    """
+    """Health check endpoint. Returns token status for Docker healthcheck and monitoring."""
     with _token_lock:
         has_token = _token is not None
         token_error = _last_token_error
-    return jsonify({
+    result = {
         "status": "ok",
         "has_token": has_token,
         "token_error": token_error,
         "deployments": len(DEPLOYMENT_IDS),
-    })
+        "auth_enabled": _auth_enabled(),
+        "stats_enabled": ENABLE_STATS,
+    }
+    if ENABLE_STATS and _db:
+        try:
+            with _db_lock:
+                row = _db.execute(
+                    "SELECT COUNT(*), COALESCE(SUM(input_tokens),0), COALESCE(SUM(output_tokens),0) FROM usage_log"
+                ).fetchone()
+            result["total_requests"] = row[0]
+            result["total_input_tokens"] = row[1]
+            result["total_output_tokens"] = row[2]
+        except Exception:
+            pass
+    return jsonify(result)
+
+
+@app.route("/stats", methods=["GET"])
+def stats():
+    """Lightweight stats: per-deployment active connections and global counters."""
+    with _deployment_lock:
+        active = dict(_deployment_active)
+    result = {"deployments_active": active}
+    if ENABLE_STATS and _db:
+        try:
+            with _db_lock:
+                row = _db.execute(
+                    "SELECT COUNT(*), COALESCE(SUM(input_tokens),0), COALESCE(SUM(output_tokens),0) FROM usage_log"
+                ).fetchone()
+            result["total_requests"] = row[0]
+            result["total_input_tokens"] = row[1]
+            result["total_output_tokens"] = row[2]
+        except Exception:
+            pass
+    return jsonify(result)
+
+
+# ---------------------------------------------------------------------------
+# Admin API (requires ENABLE_STATS=true)
+# ---------------------------------------------------------------------------
+
+@app.route("/admin/keys", methods=["GET"])
+def admin_list_keys():
+    """List all API keys in the database."""
+    if not ENABLE_STATS or not _db:
+        return jsonify({"error": "Stats not enabled"}), 404
+    with _db_lock:
+        rows = _db.execute("SELECT key, name, created_at, enabled FROM api_keys ORDER BY created_at").fetchall()
+    return jsonify([{"key": r[0], "name": r[1], "created_at": r[2], "enabled": bool(r[3])} for r in rows])
+
+
+@app.route("/admin/keys", methods=["POST"])
+def admin_create_key():
+    """Create a new API key. Body: {"name": "...", "key": "..."} (key is optional, auto-generated if missing)."""
+    if not ENABLE_STATS or not _db:
+        return jsonify({"error": "Stats not enabled"}), 404
+    data = request.get_json(silent=True) or {}
+    name = data.get("name", "unnamed")
+    key = data.get("key") or f"sk-{secrets.token_urlsafe(32)}"
+    try:
+        with _db_lock:
+            _db.execute("INSERT INTO api_keys (key, name) VALUES (?, ?)", (key, name))
+            _db.commit()
+        # Force refresh key cache
+        global _api_keys_last_refresh
+        with _api_keys_lock:
+            _api_keys_last_refresh = 0
+        return jsonify({"key": key, "name": name}), 201
+    except sqlite3.IntegrityError:
+        return jsonify({"error": "Key already exists"}), 409
+
+
+@app.route("/admin/keys/<key>", methods=["DELETE"])
+def admin_delete_key(key):
+    """Delete (disable) an API key."""
+    if not ENABLE_STATS or not _db:
+        return jsonify({"error": "Stats not enabled"}), 404
+    with _db_lock:
+        cur = _db.execute("DELETE FROM api_keys WHERE key = ?", (key,))
+        _db.commit()
+    if cur.rowcount == 0:
+        return jsonify({"error": "Key not found"}), 404
+    global _api_keys_last_refresh
+    with _api_keys_lock:
+        _api_keys_last_refresh = 0
+    return jsonify({"deleted": key})
+
+
+@app.route("/admin/usage", methods=["GET"])
+def admin_usage():
+    """Usage summary. Query params: ?key=xxx, ?days=7."""
+    if not ENABLE_STATS or not _db:
+        return jsonify({"error": "Stats not enabled"}), 404
+    key_filter = request.args.get("key")
+    days = request.args.get("days", type=int)
+    query = "SELECT api_key, COUNT(*) as requests, COALESCE(SUM(input_tokens),0), COALESCE(SUM(output_tokens),0), COALESCE(AVG(duration_ms),0) FROM usage_log"
+    params = []
+    conditions = []
+    if key_filter:
+        conditions.append("api_key = ?")
+        params.append(key_filter)
+    if days:
+        conditions.append("timestamp >= datetime('now', ?)")
+        params.append(f"-{days} days")
+    if conditions:
+        query += " WHERE " + " AND ".join(conditions)
+    query += " GROUP BY api_key ORDER BY requests DESC"
+    with _db_lock:
+        rows = _db.execute(query, params).fetchall()
+    return jsonify([{
+        "api_key": r[0], "requests": r[1],
+        "input_tokens": r[2], "output_tokens": r[3],
+        "avg_duration_ms": round(r[4]),
+    } for r in rows])
 
 
 if __name__ == "__main__":

@@ -10,9 +10,22 @@ services:
       - SAP_DEPLOYMENT_ID=<deployment-id-1>,<deployment-id-2>  # comma-separated for load balancing
       - SAP_RESOURCE_GROUP=default
       - VERBOSE=false
+      # Optional: API key auth (comma-separated, or use config file instead)
+      # - API_KEYS=sk-key1,sk-key2
+      # Optional: enable per-key usage statistics with SQLite
+      # - ENABLE_STATS=true
+    volumes:
+      # Optional: config file for API keys and settings (hot-reloaded)
+      - ./aicore-proxy:/etc/aicore-proxy
+      # Optional: SQLite persistence (only needed with ENABLE_STATS=true)
+      # - proxy-data:/app/data
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:6655/health')"]
       interval: 30s
       timeout: 10s
       retries: 3
     restart: unless-stopped
+
+# Optional: uncomment for SQLite persistence
+# volumes:
+#   proxy-data:

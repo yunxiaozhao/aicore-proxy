@@ -1,4 +1,4 @@
-"""Unit tests for proxy.py — load balancing, body adaptation, and SSE injection."""
+"""Unit tests for proxy.py — load balancing, body adaptation, SSE injection, auth, and stats."""
 
 import json
 import os
@@ -23,24 +23,20 @@ import proxy
 
 class TestLeastConnections:
     def setup_method(self):
-        """Reset deployment active counts before each test."""
         with proxy._deployment_lock:
             for dep_id in proxy._deployment_active:
                 proxy._deployment_active[dep_id] = 0
 
     def test_picks_least_active(self):
-        """Should pick the deployment with the fewest active requests."""
         with proxy._deployment_lock:
             proxy._deployment_active["dep-a"] = 5
             proxy._deployment_active["dep-b"] = 1
             proxy._deployment_active["dep-c"] = 3
         dep = proxy._next_deployment()
         assert dep == "dep-b"
-        # Active count should be incremented
         assert proxy._deployment_active["dep-b"] == 2
 
     def test_round_robin_on_tie(self):
-        """When all counts are equal, should pick the first in list order (stable)."""
         dep = proxy._next_deployment()
         assert dep == "dep-a"
         assert proxy._deployment_active["dep-a"] == 1
@@ -52,17 +48,14 @@ class TestLeastConnections:
         assert proxy._deployment_active["dep-a"] == 2
 
     def test_release_floor_zero(self):
-        """Release should never go below zero."""
         proxy._release_deployment("dep-a")
         assert proxy._deployment_active["dep-a"] == 0
 
     def test_concurrent_distribution(self):
-        """Simulating 3 concurrent requests should spread across all deployments."""
         deps = [proxy._next_deployment() for _ in range(3)]
         assert sorted(deps) == ["dep-a", "dep-b", "dep-c"]
 
     def test_concurrent_threads(self):
-        """Thread-safety: many threads acquiring and releasing should not corrupt counts."""
         results = []
 
         def acquire_and_release():
@@ -78,7 +71,6 @@ class TestLeastConnections:
             t.join()
 
         assert len(results) == 30
-        # All counts should be back to zero
         for dep_id in proxy._deployment_active:
             assert proxy._deployment_active[dep_id] == 0
 
@@ -161,10 +153,14 @@ class TestAdaptBody:
 
 class TestInjectSSEEvents:
     def _make_mock_resp(self, lines):
-        """Create a mock response with iter_lines returning given strings."""
         resp = MagicMock()
         resp.iter_lines.return_value = [line.encode("utf-8") for line in lines]
         return resp
+
+    def _reset_active(self):
+        with proxy._deployment_lock:
+            for dep_id in proxy._deployment_active:
+                proxy._deployment_active[dep_id] = 0
 
     def test_injects_event_line(self):
         resp = self._make_mock_resp([
@@ -208,17 +204,100 @@ class TestInjectSSEEvents:
             proxy._deployment_active["dep-b"] = 1
         resp = MagicMock()
         resp.iter_lines.side_effect = Exception("connection lost")
-        # Generator should not raise, but should release
         try:
             list(proxy._inject_sse_events(resp, "dep-b"))
         except Exception:
             pass
         assert proxy._deployment_active["dep-b"] == 0
 
-    def _reset_active(self):
-        with proxy._deployment_lock:
-            for dep_id in proxy._deployment_active:
-                proxy._deployment_active[dep_id] = 0
+    def test_accumulates_streaming_tokens(self):
+        """SSE events should accumulate input/output token counts."""
+        self._reset_active()
+        resp = self._make_mock_resp([
+            'data: {"type":"message_start","message":{"usage":{"input_tokens":150}}}',
+            'data: {"type":"content_block_delta","delta":{"text":"hi"}}',
+            'data: {"type":"message_delta","usage":{"output_tokens":42}}',
+        ])
+        with patch("proxy._log_usage") as mock_log:
+            list(proxy._inject_sse_events(resp, "dep-a", "sk-test", time.time()))
+            mock_log.assert_called_once()
+            args = mock_log.call_args[0]
+            assert args[0] == "sk-test"   # client_key
+            assert args[2] == 150         # input_tokens
+            assert args[3] == 42          # output_tokens
+
+
+# ---------------------------------------------------------------------------
+# Config file loading
+# ---------------------------------------------------------------------------
+
+class TestConfigLoading:
+    def test_cfg_env_var_priority(self):
+        """Env var should take priority over config file."""
+        os.environ["SAP_CLIENT_ID"] = "test-id"
+        assert proxy._cfg("SAP_CLIENT_ID", "sap_client_id") == "test-id"
+
+    def test_cfg_default(self):
+        """Should return default when neither env var nor config file has the key."""
+        assert proxy._cfg("NONEXISTENT_VAR_12345", "nonexistent", "fallback") == "fallback"
+
+    def test_load_config_file_missing(self):
+        """Missing config file should return empty dict."""
+        with patch("proxy._CONFIG_PATH", "/nonexistent/path.json"):
+            # Force re-check by resetting timer
+            proxy._config_last_check = 0
+            result = proxy._load_config_file()
+            assert isinstance(result, dict)
+
+
+# ---------------------------------------------------------------------------
+# API Key Authentication
+# ---------------------------------------------------------------------------
+
+class TestApiKeyAuth:
+    def setup_method(self):
+        """Reset key cache before each test."""
+        with proxy._api_keys_lock:
+            proxy._api_keys_cache = set()
+            proxy._api_keys_last_refresh = 0
+
+    def test_no_keys_means_no_auth(self):
+        """When no keys are configured, auth should be disabled."""
+        with patch.dict(os.environ, {"API_KEYS": ""}, clear=False):
+            with patch("proxy._load_config_file", return_value={}):
+                with proxy._api_keys_lock:
+                    proxy._api_keys_last_refresh = 0
+                assert not proxy._auth_enabled()
+
+    def test_env_var_keys(self):
+        with patch.dict(os.environ, {"API_KEYS": "sk-abc,sk-def"}, clear=False):
+            with patch("proxy._load_config_file", return_value={}):
+                with proxy._api_keys_lock:
+                    proxy._api_keys_last_refresh = 0
+                assert proxy._auth_enabled()
+                assert proxy._validate_api_key("sk-abc")
+                assert proxy._validate_api_key("sk-def")
+                assert not proxy._validate_api_key("sk-wrong")
+
+    def test_config_file_keys(self):
+        with patch.dict(os.environ, {"API_KEYS": ""}, clear=False):
+            with patch("proxy._load_config_file", return_value={"api_keys": ["sk-from-config"]}):
+                with proxy._api_keys_lock:
+                    proxy._api_keys_last_refresh = 0
+                assert proxy._auth_enabled()
+                assert proxy._validate_api_key("sk-from-config")
+
+    def test_merged_keys(self):
+        with patch.dict(os.environ, {"API_KEYS": "sk-env"}, clear=False):
+            with patch("proxy._load_config_file", return_value={"api_keys": ["sk-cfg"]}):
+                with proxy._api_keys_lock:
+                    proxy._api_keys_last_refresh = 0
+                assert proxy._validate_api_key("sk-env")
+                assert proxy._validate_api_key("sk-cfg")
+
+    def test_empty_key_rejected(self):
+        assert not proxy._validate_api_key("")
+        assert not proxy._validate_api_key(None)
 
 
 # ---------------------------------------------------------------------------
@@ -236,10 +315,54 @@ class TestMessagesEndpoint:
         with proxy._deployment_lock:
             for dep_id in proxy._deployment_active:
                 proxy._deployment_active[dep_id] = 0
+        # Disable auth for basic endpoint tests
+        with proxy._api_keys_lock:
+            proxy._api_keys_cache = set()
+            proxy._api_keys_last_refresh = 0
 
     @patch("proxy._get_token", return_value="fake-token")
     @patch("proxy._api_session")
-    def test_non_streaming_success(self, mock_session, mock_token, client):
+    @patch("proxy._auth_enabled", return_value=False)
+    def test_non_streaming_success(self, mock_auth, mock_session, mock_token, client):
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.content = json.dumps({"type": "message", "content": [], "usage": {"input_tokens": 10, "output_tokens": 5}}).encode()
+        mock_resp.headers = {"Content-Type": "application/json"}
+        mock_session.post.return_value = mock_resp
+
+        resp = client.post("/v1/messages", json={
+            "model": "claude-3", "max_tokens": 10,
+            "messages": [{"role": "user", "content": "hi"}],
+        })
+        assert resp.status_code == 200
+        for dep_id in proxy._deployment_active:
+            assert proxy._deployment_active[dep_id] == 0
+
+    @patch("proxy._get_token", return_value=None)
+    @patch("proxy._auth_enabled", return_value=False)
+    def test_no_token_returns_503(self, mock_auth, mock_token, client):
+        resp = client.post("/v1/messages", json={"messages": []})
+        assert resp.status_code == 503
+
+    @patch("proxy._auth_enabled", return_value=False)
+    def test_invalid_body_returns_400(self, mock_auth, client):
+        with patch("proxy._get_token", return_value="fake"):
+            resp = client.post("/v1/messages", data="not json",
+                               content_type="application/json")
+            assert resp.status_code == 400
+
+    @patch("proxy._auth_enabled", return_value=True)
+    @patch("proxy._validate_api_key", return_value=False)
+    def test_auth_rejects_invalid_key(self, mock_validate, mock_auth, client):
+        resp = client.post("/v1/messages", json={"messages": []},
+                           headers={"x-api-key": "bad-key"})
+        assert resp.status_code == 401
+
+    @patch("proxy._get_token", return_value="fake-token")
+    @patch("proxy._api_session")
+    @patch("proxy._auth_enabled", return_value=True)
+    @patch("proxy._validate_api_key", return_value=True)
+    def test_auth_accepts_valid_key(self, mock_validate, mock_auth, mock_session, mock_token, client):
         mock_resp = MagicMock()
         mock_resp.status_code = 200
         mock_resp.content = json.dumps({"type": "message", "content": []}).encode()
@@ -249,22 +372,25 @@ class TestMessagesEndpoint:
         resp = client.post("/v1/messages", json={
             "model": "claude-3", "max_tokens": 10,
             "messages": [{"role": "user", "content": "hi"}],
-        })
+        }, headers={"x-api-key": "sk-valid"})
         assert resp.status_code == 200
-        # Deployment should be released after non-streaming
-        for dep_id in proxy._deployment_active:
-            assert proxy._deployment_active[dep_id] == 0
 
-    @patch("proxy._get_token", return_value=None)
-    def test_no_token_returns_503(self, mock_token, client):
-        resp = client.post("/v1/messages", json={"messages": []})
-        assert resp.status_code == 503
+    @patch("proxy._get_token", return_value="fake-token")
+    @patch("proxy._api_session")
+    @patch("proxy._auth_enabled", return_value=True)
+    @patch("proxy._validate_api_key", return_value=True)
+    def test_auth_via_bearer_header(self, mock_validate, mock_auth, mock_session, mock_token, client):
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.content = json.dumps({"type": "message", "content": []}).encode()
+        mock_resp.headers = {"Content-Type": "application/json"}
+        mock_session.post.return_value = mock_resp
 
-    def test_invalid_body_returns_400(self, client):
-        with patch("proxy._get_token", return_value="fake"):
-            resp = client.post("/v1/messages", data="not json",
-                               content_type="application/json")
-            assert resp.status_code == 400
+        resp = client.post("/v1/messages", json={
+            "model": "claude-3", "max_tokens": 10,
+            "messages": [{"role": "user", "content": "hi"}],
+        }, headers={"Authorization": "Bearer sk-valid"})
+        assert resp.status_code == 200
 
 
 class TestHealthEndpoint:
@@ -280,3 +406,20 @@ class TestHealthEndpoint:
         data = resp.get_json()
         assert data["status"] == "ok"
         assert data["deployments"] == 3
+        assert "stats_enabled" in data
+        assert "auth_enabled" in data
+
+
+class TestStatsEndpoint:
+    @pytest.fixture
+    def client(self):
+        proxy.app.config["TESTING"] = True
+        with proxy.app.test_client() as c:
+            yield c
+
+    def test_stats_returns_active_counts(self, client):
+        resp = client.get("/stats")
+        assert resp.status_code == 200
+        data = resp.get_json()
+        assert "deployments_active" in data
+        assert "dep-a" in data["deployments_active"]
