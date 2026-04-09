@@ -66,6 +66,7 @@ def messages():
         tool_count = len(body.get("tools", []))
         print(f"[proxy] >>> stream={is_stream}, messages={msg_count}, tools={tool_count}, "
               f"body keys: {list(body.keys())}", flush=True)
+        print(f"[proxy] >>> messages: {json.dumps(body.get('messages', []), ensure_ascii=False, indent=2)}", flush=True)
 
     try:
         sap_resp, dep_id = forward_to_sap(headers, body, stream=is_stream)
