@@ -285,6 +285,8 @@ def adapt_body(body):
     body.pop("model", None)
     is_stream = body.pop("stream", False)
     body.pop("context_management", None)
+    body.pop("thinking", None)
+    body.pop("output_config", None)
 
     for key in ("system", "messages", "tools"):
         if key in body:
