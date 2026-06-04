@@ -3,7 +3,20 @@
   "sap_client_secret": "<your-client-secret>",
   "sap_auth_url": "https://<your-subdomain>.authentication.<region>.hana.ondemand.com",
   "sap_ai_api_url": "https://api.ai.prod.<region>.aws.ml.hana.ondemand.com",
+
   "sap_deployment_id": ["<deployment-id-1>", "<deployment-id-2>"],
+
+  "//": "Two ways to set sap_deployment_id:",
+  "//1": "  Flat (legacy):    a list/string of deployment ids -- the request's `model` field is ignored, all requests are load-balanced across the same pool.",
+  "//2": "  Model-aware:      a dict keyed by `opus` / `sonnet` / `haiku` -- the proxy reads the request's `model` string and routes by keyword. Unknown models fall back to the union of all pools. Example:",
+  "//example_model_aware": {
+    "sap_deployment_id": {
+      "opus":   ["<opus-dep-1>", "<opus-dep-2>"],
+      "sonnet": ["<sonnet-dep-1>"],
+      "haiku":  ["<haiku-dep-1>"]
+    }
+  },
+
   "sap_resource_group": "default",
   "verbose": false,
   "api_keys": ["sk-your-key-1", "sk-your-key-2"],

@@ -8,6 +8,13 @@ services:
       - SAP_AUTH_URL=https://<your-subdomain>.authentication.<region>.hana.ondemand.com
       - SAP_AI_API_URL=https://api.ai.prod.<region>.aws.ml.hana.ondemand.com
       - SAP_DEPLOYMENT_ID=<deployment-id-1>,<deployment-id-2>  # comma-separated for load balancing
+      # Optional: model-aware routing. If ANY of the per-model vars below are
+      # set, the proxy reads the client request's "model" field and routes by
+      # keyword (opus/sonnet/haiku) to the matching pool. Unknown models fall
+      # back to SAP_DEPLOYMENT_ID. Leave commented for legacy behavior.
+      # - SAP_DEPLOYMENT_ID_OPUS=<opus-dep-1>,<opus-dep-2>
+      # - SAP_DEPLOYMENT_ID_SONNET=<sonnet-dep-1>
+      # - SAP_DEPLOYMENT_ID_HAIKU=<haiku-dep-1>
       - SAP_RESOURCE_GROUP=default
       - VERBOSE=false
       # Optional: API key auth (comma-separated, or use config file instead)

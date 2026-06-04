@@ -24,6 +24,7 @@ SAP AI Core (Claude model)
 - **Built-in tool filtering** — strips Anthropic server-side tools (`web_search`, `text_editor`, etc.) that SAP AI Core doesn't support
 - **401 auto-retry** — transparently refreshes token and retries on authentication failure
 - **Least-connections load balancing** — distributes requests across multiple SAP AI Core deployments, routing each request to the deployment with the fewest active connections; ideal for concurrent subagent workloads. Configure via comma-separated `SAP_DEPLOYMENT_ID`
+- **Model-aware routing (optional)** — when separate `SAP_DEPLOYMENT_ID_OPUS` / `_SONNET` / `_HAIKU` env vars (or a per-model dict in the config file) are configured, the proxy inspects the client's `model` string for `opus`/`sonnet`/`haiku` and routes to the matching pool, falling back to the full pool for unknown models. With only the legacy `SAP_DEPLOYMENT_ID` set, behavior is unchanged: the request's `model` field is ignored.
 - **API key authentication** — optional client API key validation via env var, config file, or database; disabled when no keys configured (backward compatible)
 - **Config file support** — settings can be provided via `/etc/aicore-proxy/config.json` (volume-mounted), with env vars taking priority; `api_keys` field is hot-reloaded every 60s
 - **Usage statistics** — optional per-key request and token usage tracking with SQLite (enable via `ENABLE_STATS=true`)
@@ -86,6 +87,7 @@ Edit `docker-compose.yml` and fill in your SAP AI Core credentials:
 | `SAP_AUTH_URL` | XSUAA token endpoint base URL |
 | `SAP_AI_API_URL` | SAP AI Core API base URL |
 | `SAP_DEPLOYMENT_ID` | Deployment ID(s), comma-separated for load balancing |
+| `SAP_DEPLOYMENT_ID_OPUS` / `_SONNET` / `_HAIKU` | Optional. Per-model deployment pools — when any is set, the proxy routes based on the client's `model` field (opus/sonnet/haiku keyword) instead of round-robining across `SAP_DEPLOYMENT_ID`. Unknown models fall back to `SAP_DEPLOYMENT_ID`. |
 | `SAP_RESOURCE_GROUP` | Resource group (default: `default`) |
 | `VERBOSE` | Enable detailed request/response logging (default: `false`) |
 | `API_KEYS` | Optional: comma-separated API keys for client authentication |
@@ -106,6 +108,8 @@ cat > ./aicore-proxy/config.json << 'EOF'
   "sap_auth_url": "https://...",
   "sap_ai_api_url": "https://...",
   "sap_deployment_id": "id1,id2",
+  "//": "Or, for model-aware routing, replace the line above with a dict:",
+  "//example": "\"sap_deployment_id\": {\"opus\": [\"opus-id-1\"], \"sonnet\": [\"sonnet-id-1\"], \"haiku\": [\"haiku-id-1\"]}",
   "api_keys": ["sk-key1", "sk-key2"],
   "enable_stats": true
 }

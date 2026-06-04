@@ -78,30 +78,85 @@ class TestLeastConnections:
 
 
 # ---------------------------------------------------------------------------
+# Model-aware routing
+# ---------------------------------------------------------------------------
+
+class TestModelAwareRouting:
+    def setup_method(self):
+        # Snapshot and patch the per-model config so tests are isolated.
+        self._orig_by_model = proxy.DEPLOYMENT_IDS_BY_MODEL
+        self._orig_kw = proxy.MODEL_KEYWORDS
+        proxy.DEPLOYMENT_IDS_BY_MODEL = {
+            "opus": ["dep-a"],
+            "sonnet": ["dep-b"],
+            "haiku": ["dep-c"],
+        }
+        with proxy._deployment_lock:
+            for dep_id in proxy._deployment_active:
+                proxy._deployment_active[dep_id] = 0
+
+    def teardown_method(self):
+        proxy.DEPLOYMENT_IDS_BY_MODEL = self._orig_by_model
+        with proxy._deployment_lock:
+            for dep_id in proxy._deployment_active:
+                proxy._deployment_active[dep_id] = 0
+
+    def test_routes_opus(self):
+        assert proxy._next_deployment("claude-opus-4-8") == "dep-a"
+
+    def test_routes_sonnet(self):
+        assert proxy._next_deployment("claude-sonnet-4-6") == "dep-b"
+
+    def test_routes_haiku(self):
+        assert proxy._next_deployment("claude-haiku-4-5-20251001") == "dep-c"
+
+    def test_unknown_model_falls_back_to_full_pool(self):
+        # No keyword match → falls back to DEPLOYMENT_IDS (least-active overall).
+        dep = proxy._next_deployment("gpt-4")
+        assert dep in proxy.DEPLOYMENT_IDS
+
+    def test_no_hint_falls_back_to_full_pool(self):
+        dep = proxy._next_deployment(None)
+        assert dep in proxy.DEPLOYMENT_IDS
+
+    def test_flat_mode_ignores_hint(self):
+        # When no per-model config is set, hint is ignored entirely.
+        proxy.DEPLOYMENT_IDS_BY_MODEL = {}
+        dep = proxy._next_deployment("claude-opus-4-8")
+        assert dep in proxy.DEPLOYMENT_IDS
+
+    def test_empty_pool_falls_back(self):
+        proxy.DEPLOYMENT_IDS_BY_MODEL = {"opus": []}
+        dep = proxy._next_deployment("claude-opus-4-8")
+        assert dep in proxy.DEPLOYMENT_IDS
+
+
+# ---------------------------------------------------------------------------
 # Body adaptation
 # ---------------------------------------------------------------------------
 
 class TestAdaptBody:
     def test_strips_model_and_stream(self):
         body = {"model": "claude-3", "stream": True, "messages": []}
-        adapted, is_stream = proxy.adapt_body(body)
+        adapted, is_stream, model = proxy.adapt_body(body)
         assert "model" not in adapted
         assert "stream" not in adapted
         assert is_stream is True
+        assert model == "claude-3"
 
     def test_adds_anthropic_version(self):
         body = {"messages": []}
-        adapted, _ = proxy.adapt_body(body)
+        adapted, _, _ = proxy.adapt_body(body)
         assert adapted["anthropic_version"] == "bedrock-2023-05-31"
 
     def test_preserves_existing_anthropic_version(self):
         body = {"anthropic_version": "custom-ver", "messages": []}
-        adapted, _ = proxy.adapt_body(body)
+        adapted, _, _ = proxy.adapt_body(body)
         assert adapted["anthropic_version"] == "custom-ver"
 
     def test_strips_context_management(self):
         body = {"context_management": {"mode": "auto"}, "messages": []}
-        adapted, _ = proxy.adapt_body(body)
+        adapted, _, _ = proxy.adapt_body(body)
         assert "context_management" not in adapted
 
     def test_strips_cache_control(self):
@@ -113,7 +168,7 @@ class TestAdaptBody:
             ],
             "system": [{"type": "text", "text": "sys", "cache_control": {"type": "ephemeral"}}],
         }
-        adapted, _ = proxy.adapt_body(body)
+        adapted, _, _ = proxy.adapt_body(body)
         assert "cache_control" not in adapted["messages"][0]["content"][0]
         assert "cache_control" not in adapted["system"][0]
 
@@ -128,7 +183,7 @@ class TestAdaptBody:
             ],
             "tool_choice": {"type": "auto"},
         }
-        adapted, _ = proxy.adapt_body(body)
+        adapted, _, _ = proxy.adapt_body(body)
         assert len(adapted["tools"]) == 2
         assert adapted["tools"][0]["name"] == "my_tool"
         assert adapted["tools"][1]["name"] == "another_tool"
@@ -139,14 +194,19 @@ class TestAdaptBody:
             "tools": [{"type": "web_search_20250305", "name": "web_search"}],
             "tool_choice": {"type": "auto"},
         }
-        adapted, _ = proxy.adapt_body(body)
+        adapted, _, _ = proxy.adapt_body(body)
         assert "tools" not in adapted
         assert "tool_choice" not in adapted
 
     def test_default_stream_false(self):
         body = {"messages": []}
-        _, is_stream = proxy.adapt_body(body)
+        _, is_stream, _ = proxy.adapt_body(body)
         assert is_stream is False
+
+    def test_returns_none_model_when_absent(self):
+        body = {"messages": []}
+        _, _, model = proxy.adapt_body(body)
+        assert model is None
 
 
 # ---------------------------------------------------------------------------
