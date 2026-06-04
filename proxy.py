@@ -23,7 +23,8 @@ from urllib3.util.retry import Retry
 
 from config import (
     CLIENT_ID, CLIENT_SECRET, AUTH_URL, AI_API_URL,
-    DEPLOYMENT_IDS, RESOURCE_GROUP, VERBOSE, ENABLE_STATS,
+    DEPLOYMENT_IDS, DEPLOYMENT_IDS_BY_MODEL, MODEL_KEYWORDS,
+    RESOURCE_GROUP, VERBOSE, ENABLE_STATS,
     log_usage,
 )
 
@@ -35,14 +36,38 @@ _deployment_active = {dep_id: 0 for dep_id in DEPLOYMENT_IDS}
 _deployment_lock = threading.Lock()
 
 
-def _next_deployment():
+def _resolve_pool(model_hint):
+    """Return the deployment pool to load-balance across for this request.
+
+    - In flat mode (no per-model config), always returns DEPLOYMENT_IDS.
+    - In model-aware mode, scans model_hint for "opus"/"sonnet"/"haiku" and
+      returns that pool. Falls back to DEPLOYMENT_IDS if there's no match or
+      the matched pool is empty.
+    """
+    if not DEPLOYMENT_IDS_BY_MODEL or not model_hint:
+        return DEPLOYMENT_IDS
+    hint = model_hint.lower()
+    for kw in MODEL_KEYWORDS:
+        if kw in hint:
+            pool = DEPLOYMENT_IDS_BY_MODEL.get(kw)
+            if pool:
+                return pool
+            break
+    return DEPLOYMENT_IDS
+
+
+def _next_deployment(model_hint=None):
     """Pick the deployment with the fewest active requests (least-connections).
 
     Increments the active count atomically before returning.
     Caller MUST call _release_deployment() when the request completes.
+
+    If model-aware mode is configured and `model_hint` matches a known model
+    keyword, the pick is restricted to the matching pool.
     """
+    pool = _resolve_pool(model_hint)
     with _deployment_lock:
-        dep = min(DEPLOYMENT_IDS, key=lambda d: _deployment_active[d])
+        dep = min(pool, key=lambda d: _deployment_active[d])
         _deployment_active[dep] += 1
         return dep
 
@@ -173,13 +198,16 @@ def get_token_status():
 # SAP AI Core request forwarding
 # ---------------------------------------------------------------------------
 
-def forward_to_sap(headers, body, stream):
+def forward_to_sap(headers, body, stream, model_hint=None):
     """Forward the request to SAP AI Core; auto-retry once on 401 after refreshing the token.
+
+    `model_hint` is the original request's "model" string (already stripped from
+    body); used only to pick a deployment pool in model-aware mode.
 
     Returns (requests.Response, deployment_id) tuple.
     Raises req_lib.Timeout or req_lib.RequestException on failure.
     """
-    deployment_id = _next_deployment()
+    deployment_id = _next_deployment(model_hint)
     subpath = "invoke-with-response-stream" if stream else "invoke"
     target_url = f"{AI_API_URL}/v2/inference/deployments/{deployment_id}/{subpath}"
     if VERBOSE:
@@ -277,12 +305,15 @@ def _strip_cache_control(obj):
 def adapt_body(body):
     """Adapt Anthropic request body to SAP AI Core compatible format.
 
-    Returns (body, is_stream). Modifies body dict in place.
+    Returns (body, is_stream, model). Modifies body dict in place.
+    `model` is the original request's "model" field (or None) — kept for the
+    caller to use as a routing hint; SAP AI Core does not accept this field
+    so it's removed from the body itself.
     """
     if "anthropic_version" not in body:
         body["anthropic_version"] = "bedrock-2023-05-31"
 
-    body.pop("model", None)
+    model = body.pop("model", None)
     is_stream = body.pop("stream", False)
     body.pop("context_management", None)
     body.pop("thinking", None)
@@ -299,4 +330,4 @@ def adapt_body(body):
             del body["tools"]
             body.pop("tool_choice", None)
 
-    return body, is_stream
+    return body, is_stream, model

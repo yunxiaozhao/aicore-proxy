@@ -73,11 +73,64 @@ CLIENT_ID = _cfg("SAP_CLIENT_ID", "sap_client_id")
 CLIENT_SECRET = _cfg("SAP_CLIENT_SECRET", "sap_client_secret")
 AUTH_URL = _cfg("SAP_AUTH_URL", "sap_auth_url")
 AI_API_URL = _cfg("SAP_AI_API_URL", "sap_ai_api_url")
+
+
+def _parse_dep_list(val):
+    """Normalize a deployment-id setting into a list of trimmed strings.
+
+    Accepts a list of strings, a comma-separated string, or any scalar coerced
+    to string. Returns [] for None / empty inputs.
+    """
+    if val is None:
+        return []
+    if isinstance(val, list):
+        return [d.strip() for d in val if isinstance(d, str) and d.strip()]
+    return [d.strip() for d in str(val).split(",") if d.strip()]
+
+
+# ---------------------------------------------------------------------------
+# Deployment IDs — two modes:
+#
+# 1. Flat (legacy):       SAP_DEPLOYMENT_ID="id1,id2"  /  "sap_deployment_id": ["id1","id2"]
+#    All requests are load-balanced across the same pool, ignoring the client's
+#    "model" field.
+#
+# 2. Model-aware (opt-in): per-model env vars OR a dict in the config file:
+#       SAP_DEPLOYMENT_ID_OPUS="id1,id2"
+#       SAP_DEPLOYMENT_ID_SONNET="id3"
+#       SAP_DEPLOYMENT_ID_HAIKU="id4"
+#       "sap_deployment_id": {"opus": ["id1","id2"], "sonnet": "id3", "haiku": "id4"}
+#    The proxy inspects the request's "model" string for "opus"/"sonnet"/"haiku"
+#    and routes to the matching pool. If no keyword matches (or that pool is
+#    empty) it falls back to the union of all configured deployments.
+#
+# DEPLOYMENT_IDS is always the union (used for active-count bookkeeping and the
+# fallback pool). DEPLOYMENT_IDS_BY_MODEL is non-empty only in mode 2.
+# ---------------------------------------------------------------------------
+MODEL_KEYWORDS = ("opus", "sonnet", "haiku")
+
+DEPLOYMENT_IDS_BY_MODEL = {}
+
+# Per-model env vars (highest priority) — if any is set, model-aware mode kicks in.
+for _kw in MODEL_KEYWORDS:
+    _env = os.environ.get(f"SAP_DEPLOYMENT_ID_{_kw.upper()}")
+    if _env:
+        DEPLOYMENT_IDS_BY_MODEL[_kw] = _parse_dep_list(_env)
+
 _dep_raw = _cfg("SAP_DEPLOYMENT_ID", "sap_deployment_id", "")
-if isinstance(_dep_raw, list):
-    DEPLOYMENT_IDS = [d.strip() for d in _dep_raw if isinstance(d, str) and d.strip()]
+if isinstance(_dep_raw, dict):
+    # Config file specifies per-model dict; env vars (above) override matching keys.
+    for _k, _v in _dep_raw.items():
+        _kk = _k.lower()
+        if _kk in MODEL_KEYWORDS and _kk not in DEPLOYMENT_IDS_BY_MODEL:
+            DEPLOYMENT_IDS_BY_MODEL[_kk] = _parse_dep_list(_v)
+    DEPLOYMENT_IDS = sorted({d for lst in DEPLOYMENT_IDS_BY_MODEL.values() for d in lst})
+elif DEPLOYMENT_IDS_BY_MODEL:
+    # Only per-model env vars supplied; no legacy list to merge.
+    DEPLOYMENT_IDS = sorted({d for lst in DEPLOYMENT_IDS_BY_MODEL.values() for d in lst})
 else:
-    DEPLOYMENT_IDS = [d.strip() for d in str(_dep_raw).split(",") if d.strip()]
+    DEPLOYMENT_IDS = _parse_dep_list(_dep_raw)
+
 RESOURCE_GROUP = _cfg("SAP_RESOURCE_GROUP", "sap_resource_group", "default")
 VERBOSE = str(_cfg("VERBOSE", "verbose", "false")).lower() in ("true", "1", "yes")
 ENABLE_STATS = str(_cfg("ENABLE_STATS", "enable_stats", "false")).lower() in ("true", "1", "yes")
@@ -87,7 +140,11 @@ if not CLIENT_ID or not CLIENT_SECRET or not AUTH_URL or not AI_API_URL:
 if not DEPLOYMENT_IDS:
     raise ValueError("SAP_DEPLOYMENT_ID must contain at least one deployment ID")
 
-print(f"[proxy] Configured {len(DEPLOYMENT_IDS)} deployment(s): {DEPLOYMENT_IDS}", flush=True)
+if DEPLOYMENT_IDS_BY_MODEL:
+    print(f"[proxy] Configured {len(DEPLOYMENT_IDS)} deployment(s) in model-aware mode: "
+          f"{ {k: v for k, v in DEPLOYMENT_IDS_BY_MODEL.items()} }", flush=True)
+else:
+    print(f"[proxy] Configured {len(DEPLOYMENT_IDS)} deployment(s): {DEPLOYMENT_IDS}", flush=True)
 
 
 # ---------------------------------------------------------------------------

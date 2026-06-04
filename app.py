@@ -52,7 +52,7 @@ def messages():
     if not isinstance(body, dict):
         return jsonify({"error": "Invalid JSON body"}), 400
 
-    body, is_stream = adapt_body(body)
+    body, is_stream, req_model = adapt_body(body)
     req_start = time.time()
 
     headers = {
@@ -64,12 +64,12 @@ def messages():
     if VERBOSE:
         msg_count = len(body.get("messages", []))
         tool_count = len(body.get("tools", []))
-        print(f"[proxy] >>> stream={is_stream}, messages={msg_count}, tools={tool_count}, "
+        print(f"[proxy] >>> model={req_model!r}, stream={is_stream}, messages={msg_count}, tools={tool_count}, "
               f"body keys: {list(body.keys())}\n"
               f"  messages: {json.dumps(body.get('messages', []), ensure_ascii=False)}", flush=True)
 
     try:
-        sap_resp, dep_id = forward_to_sap(headers, body, stream=is_stream)
+        sap_resp, dep_id = forward_to_sap(headers, body, stream=is_stream, model_hint=req_model)
     except req_lib.Timeout:
         log_usage(client_key, None, 0, 0, 504, is_stream, int((time.time() - req_start) * 1000))
         return jsonify({"error": "Upstream SAP AI Core timeout"}), 504
@@ -108,7 +108,7 @@ def messages():
             sap_resp.close()
             if attempt == 0:
                 try:
-                    sap_resp, dep_id2 = forward_to_sap(headers, body, stream=False)
+                    sap_resp, dep_id2 = forward_to_sap(headers, body, stream=False, model_hint=req_model)
                 except req_lib.Timeout:
                     release_deployment(dep_id)
                     log_usage(client_key, dep_id, 0, 0, 504, False, int((time.time() - req_start) * 1000))
