@@ -336,6 +336,36 @@ def adapt_body(body):
         if key in body:
             _strip_cache_control(body[key])
 
+    # Bedrock's Claude models reject messages with role="system" — only the
+    # top-level `system` field is allowed. Claude Code occasionally sends
+    # extra system-role messages (e.g. dynamic agent-type descriptions) in
+    # the messages array, which triggers a "role 'system' is not supported
+    # on this model" 400. Merge them into the top-level `system` field.
+    messages = body.get("messages")
+    if isinstance(messages, list):
+        kept, extracted_system_blocks = [], []
+        for m in messages:
+            if isinstance(m, dict) and m.get("role") == "system":
+                content = m.get("content")
+                if isinstance(content, str):
+                    if content:
+                        extracted_system_blocks.append({"type": "text", "text": content})
+                elif isinstance(content, list):
+                    for c in content:
+                        if isinstance(c, dict) and c.get("type") == "text" and c.get("text"):
+                            extracted_system_blocks.append({"type": "text", "text": c["text"]})
+            else:
+                kept.append(m)
+        if extracted_system_blocks:
+            body["messages"] = kept
+            existing = body.get("system")
+            if isinstance(existing, list):
+                existing.extend(extracted_system_blocks)
+            elif isinstance(existing, str) and existing:
+                body["system"] = [{"type": "text", "text": existing}] + extracted_system_blocks
+            else:
+                body["system"] = extracted_system_blocks
+
     if "tools" in body:
         body["tools"] = [t for t in body["tools"]
                          if t.get("type", "custom") == "custom"]
