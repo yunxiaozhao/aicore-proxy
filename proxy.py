@@ -310,14 +310,19 @@ def adapt_body(body):
     caller to use as a routing hint; SAP AI Core does not accept this field
     so it's removed from the body itself.
     """
-    if "anthropic_version" not in body:
-        body["anthropic_version"] = "bedrock-2023-05-31"
+    # Bedrock requires the "bedrock-2023-05-31" anthropic_version; force it
+    # even if the client sent an Anthropic-native version like "2023-06-01"
+    body["anthropic_version"] = "bedrock-2023-05-31"
 
     model = body.pop("model", None)
     is_stream = body.pop("stream", False)
     body.pop("context_management", None)
     body.pop("thinking", None)
     body.pop("output_config", None)
+    # `metadata` (e.g. {"user_id": "..."}) is Anthropic-native and not accepted
+    # by Bedrock; some Bedrock Claude models return a misleading
+    # "role 'system' is not supported on this model" error when it's present.
+    body.pop("metadata", None)
 
     for key in ("system", "messages", "tools"):
         if key in body:
