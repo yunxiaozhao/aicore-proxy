@@ -327,6 +327,10 @@ def adapt_body(body):
     body.pop("context_management", None)
     body.pop("thinking", None)
     body.pop("output_config", None)
+    # `metadata` (e.g. {"user_id": "..."}) is Anthropic-native and not accepted
+    # by Bedrock; Bedrock returns a misleading
+    # "role 'system' is not supported on this model" 400 when it's present.
+    body.pop("metadata", None)
 
     for key in ("system", "messages", "tools"):
         if key in body:
