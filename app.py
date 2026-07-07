@@ -17,9 +17,13 @@ import sqlite3
 import requests as req_lib
 from flask import Flask, request, Response, jsonify
 
+from functools import wraps
+
 from config import (
     DEPLOYMENT_IDS, RESOURCE_GROUP, VERBOSE, ENABLE_STATS,
     auth_enabled, validate_api_key, reset_api_keys_cache,
+    admin_token_configured, validate_admin_token,
+    hash_key, key_prefix,
     log_usage, db_execute, db_execute_write,
     _db,
 )
@@ -189,60 +193,124 @@ def stats():
 
 
 # ---------------------------------------------------------------------------
-# Admin API (requires ENABLE_STATS=true)
+# Admin API (requires ENABLE_STATS=true AND a valid ADMIN_TOKEN)
+#
+# Auth: send the admin token in the `X-Admin-Token` header, or in
+#       `Authorization: Bearer <token>`. If ADMIN_TOKEN isn't configured, every
+#       /admin/* route returns 403 — the interface is off by default.
+#
+# Responses NEVER include a stored key in plaintext. The plaintext of a newly
+# created key is returned exactly once, in the POST /admin/keys response, and
+# never persisted anywhere the API can read back. Existing keys are identified
+# by their key_prefix (first 12 chars + '…') for display, and by the full
+# key_hash (sha256 hex) for filtering.
 # ---------------------------------------------------------------------------
 
+def require_admin(fn):
+    """Gate an admin route on ENABLE_STATS + ADMIN_TOKEN header check."""
+    @wraps(fn)
+    def wrapper(*args, **kwargs):
+        if not ENABLE_STATS or not _db:
+            return jsonify({"error": "Stats not enabled"}), 404
+        if not admin_token_configured():
+            return jsonify({"error": "Admin API disabled (ADMIN_TOKEN not set)"}), 403
+        token = request.headers.get("X-Admin-Token", "")
+        if not token:
+            auth_header = request.headers.get("Authorization", "")
+            if auth_header.startswith("Bearer "):
+                token = auth_header[7:].strip()
+        if not validate_admin_token(token):
+            return jsonify({"error": "Unauthorized"}), 401
+        return fn(*args, **kwargs)
+    return wrapper
+
+
 @app.route("/admin/keys", methods=["GET"])
+@require_admin
 def admin_list_keys():
-    """List all API keys in the database."""
-    if not ENABLE_STATS or not _db:
-        return jsonify({"error": "Stats not enabled"}), 404
-    rows = db_execute("SELECT key, name, created_at, enabled FROM api_keys ORDER BY created_at")
-    return jsonify([{"key": r[0], "name": r[1], "created_at": r[2], "enabled": bool(r[3])} for r in rows])
+    """List all API keys. Only the masked key_prefix is returned — never the raw key."""
+    rows = db_execute(
+        "SELECT key_hash, key_prefix, name, created_at, enabled FROM api_keys ORDER BY created_at"
+    )
+    return jsonify([{
+        "key_hash": r[0],
+        "key_prefix": r[1],
+        "name": r[2],
+        "created_at": r[3],
+        "enabled": bool(r[4]),
+    } for r in rows])
 
 
 @app.route("/admin/keys", methods=["POST"])
+@require_admin
 def admin_create_key():
-    """Create a new API key. Body: {"name": "...", "key": "..."} (key is optional, auto-generated if missing)."""
-    if not ENABLE_STATS or not _db:
-        return jsonify({"error": "Stats not enabled"}), 404
+    """Create a new API key. Body: {"name": "..."}. The plaintext key is returned once here."""
     import secrets
     data = request.get_json(silent=True) or {}
     name = data.get("name", "unnamed")
+    # Allow the caller to pass in a chosen key (e.g. for migration), but strongly prefer
+    # server-generated ones — we can't guarantee externally-supplied keys have high entropy.
     key = data.get("key") or f"sk-{secrets.token_urlsafe(32)}"
+    kh = hash_key(key)
+    kp = key_prefix(key)
     try:
-        db_execute_write("INSERT INTO api_keys (key, name) VALUES (?, ?)", (key, name))
+        db_execute_write(
+            "INSERT INTO api_keys (key_hash, key_prefix, name) VALUES (?, ?, ?)",
+            (kh, kp, name),
+        )
         reset_api_keys_cache()
-        return jsonify({"key": key, "name": name}), 201
+        # This is the ONLY time we ever return the plaintext key.
+        return jsonify({
+            "key": key,
+            "key_hash": kh,
+            "key_prefix": kp,
+            "name": name,
+            "warning": "Store this key now — it will not be shown again.",
+        }), 201
     except sqlite3.IntegrityError:
         return jsonify({"error": "Key already exists"}), 409
 
 
-@app.route("/admin/keys/<key>", methods=["DELETE"])
-def admin_delete_key(key):
-    """Delete (disable) an API key."""
-    if not ENABLE_STATS or not _db:
-        return jsonify({"error": "Stats not enabled"}), 404
-    cur = db_execute_write("DELETE FROM api_keys WHERE key = ?", (key,))
-    if cur.rowcount == 0:
-        return jsonify({"error": "Key not found"}), 404
-    reset_api_keys_cache()
-    return jsonify({"deleted": key})
+@app.route("/admin/keys/<identifier>", methods=["DELETE"])
+@require_admin
+def admin_delete_key(identifier):
+    """Delete an API key. `identifier` is either the full key_hash or (fallback) a raw key.
+
+    Passing the raw key still works so admins can revoke a leaked key without first
+    looking up its hash, but we hash it locally rather than storing it.
+    """
+    # If it looks like a sha256 hex digest, try that first; otherwise treat as a raw key.
+    candidates = []
+    if len(identifier) == 64 and all(c in "0123456789abcdef" for c in identifier.lower()):
+        candidates.append(identifier.lower())
+    candidates.append(hash_key(identifier))
+    for kh in candidates:
+        cur = db_execute_write("DELETE FROM api_keys WHERE key_hash = ?", (kh,))
+        if cur.rowcount:
+            reset_api_keys_cache()
+            return jsonify({"deleted": kh})
+    return jsonify({"error": "Key not found"}), 404
 
 
 @app.route("/admin/usage", methods=["GET"])
+@require_admin
 def admin_usage():
-    """Usage summary. Query params: ?key=xxx, ?days=7, ?group_by=day."""
-    if not ENABLE_STATS or not _db:
-        return jsonify({"error": "Stats not enabled"}), 404
-    key_filter = request.args.get("key")
+    """Usage summary. Query params: ?key_hash=xxx | ?key=xxx, ?days=7, ?group_by=day.
+
+    Passing `key=<raw>` hashes it server-side and filters on the hash — the raw
+    value is never echoed back in the response.
+    """
+    key_hash_filter = request.args.get("key_hash")
+    raw_key_filter = request.args.get("key")
+    if raw_key_filter and not key_hash_filter:
+        key_hash_filter = hash_key(raw_key_filter)
     days = request.args.get("days", type=int)
     group_by = request.args.get("group_by", "")
     params = []
     conditions = []
-    if key_filter:
-        conditions.append("api_key = ?")
-        params.append(key_filter)
+    if key_hash_filter:
+        conditions.append("key_hash = ?")
+        params.append(key_hash_filter)
     if days:
         conditions.append("timestamp >= datetime('now', ?)")
         params.append(f"-{days} days")
@@ -250,28 +318,30 @@ def admin_usage():
 
     if group_by == "day":
         query = (
-            f"SELECT DATE(timestamp) as date, api_key, COUNT(*) as requests, "
+            f"SELECT DATE(timestamp) as date, key_hash, "
+            f"COALESCE(MAX(key_prefix), '') as prefix, COUNT(*) as requests, "
             f"COALESCE(SUM(input_tokens),0), COALESCE(SUM(output_tokens),0), "
             f"COALESCE(AVG(duration_ms),0) FROM usage_log{where} "
-            f"GROUP BY date, api_key ORDER BY date DESC, requests DESC"
+            f"GROUP BY date, key_hash ORDER BY date DESC, requests DESC"
         )
         rows = db_execute(query, params)
         return jsonify([{
-            "date": r[0], "api_key": r[1], "requests": r[2],
-            "input_tokens": r[3], "output_tokens": r[4],
-            "avg_duration_ms": round(r[5]),
+            "date": r[0], "key_hash": r[1], "key_prefix": r[2],
+            "requests": r[3], "input_tokens": r[4], "output_tokens": r[5],
+            "avg_duration_ms": round(r[6]),
         } for r in rows])
 
     query = (
-        f"SELECT api_key, COUNT(*) as requests, COALESCE(SUM(input_tokens),0), "
+        f"SELECT key_hash, COALESCE(MAX(key_prefix), '') as prefix, "
+        f"COUNT(*) as requests, COALESCE(SUM(input_tokens),0), "
         f"COALESCE(SUM(output_tokens),0), COALESCE(AVG(duration_ms),0) FROM usage_log{where} "
-        f"GROUP BY api_key ORDER BY requests DESC"
+        f"GROUP BY key_hash ORDER BY requests DESC"
     )
     rows = db_execute(query, params)
     return jsonify([{
-        "api_key": r[0], "requests": r[1],
-        "input_tokens": r[2], "output_tokens": r[3],
-        "avg_duration_ms": round(r[4]),
+        "key_hash": r[0], "key_prefix": r[1], "requests": r[2],
+        "input_tokens": r[3], "output_tokens": r[4],
+        "avg_duration_ms": round(r[5]),
     } for r in rows])
 
 

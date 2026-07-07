@@ -319,7 +319,7 @@ class TestApiKeyAuth:
     def setup_method(self):
         """Reset key cache before each test."""
         with config._api_keys_lock:
-            config._api_keys_cache = set()
+            config._api_key_hashes = set()
             config._api_keys_last_refresh = 0
 
     def test_no_keys_means_no_auth(self):
@@ -377,7 +377,7 @@ class TestMessagesEndpoint:
             for dep_id in proxy._deployment_active:
                 proxy._deployment_active[dep_id] = 0
         with config._api_keys_lock:
-            config._api_keys_cache = set()
+            config._api_key_hashes = set()
             config._api_keys_last_refresh = 0
 
     @patch("app.get_token", return_value="fake-token")

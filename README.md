@@ -25,10 +25,10 @@ SAP AI Core (Claude model)
 - **401 auto-retry** — transparently refreshes token and retries on authentication failure
 - **Least-connections load balancing** — distributes requests across multiple SAP AI Core deployments, routing each request to the deployment with the fewest active connections; ideal for concurrent subagent workloads. Configure via comma-separated `SAP_DEPLOYMENT_ID`
 - **Model-aware routing (optional)** — when separate `SAP_DEPLOYMENT_ID_OPUS` / `_SONNET` / `_HAIKU` env vars (or a per-model dict in the config file) are configured, the proxy inspects the client's `model` string for `opus`/`sonnet`/`haiku` and routes to the matching pool, falling back to the full pool for unknown models. With only the legacy `SAP_DEPLOYMENT_ID` set, behavior is unchanged: the request's `model` field is ignored.
-- **API key authentication** — optional client API key validation via env var, config file, or database; disabled when no keys configured (backward compatible)
+- **API key authentication** — optional client API key validation via env var, config file, or database; disabled when no keys configured (backward compatible). DB-managed keys are stored only as SHA-256 hashes, never plaintext.
 - **Config file support** — settings can be provided via `/etc/aicore-proxy/config.json` (volume-mounted), with env vars taking priority; `api_keys` field is hot-reloaded every 60s
-- **Usage statistics** — optional per-key request and token usage tracking with SQLite (enable via `ENABLE_STATS=true`)
-- **Admin API** — manage API keys and query usage stats via REST endpoints (requires `ENABLE_STATS=true`)
+- **Usage statistics** — optional per-key request and token usage tracking with SQLite (enable via `ENABLE_STATS=true`); the log stores only the key's hash and display prefix, not the raw key
+- **Admin API** — manage API keys and query usage stats via REST endpoints (requires `ENABLE_STATS=true` **and** a configured `ADMIN_TOKEN`)
 - **Health check & stats endpoints** — `GET /health` for Docker healthcheck, `GET /stats` for deployment active connections
 
 ## Quick Start
@@ -90,8 +90,9 @@ Edit `docker-compose.yml` and fill in your SAP AI Core credentials:
 | `SAP_DEPLOYMENT_ID_OPUS` / `_SONNET` / `_HAIKU` | Optional. Per-model deployment pools — when any is set, the proxy routes based on the client's `model` field (opus/sonnet/haiku keyword) instead of round-robining across `SAP_DEPLOYMENT_ID`. Unknown models fall back to `SAP_DEPLOYMENT_ID`. |
 | `SAP_RESOURCE_GROUP` | Resource group (default: `default`) |
 | `VERBOSE` | Enable detailed request/response logging (default: `false`) |
-| `API_KEYS` | Optional: comma-separated API keys for client authentication |
+| `API_KEYS` | Optional: comma-separated API keys for client authentication. Values are hashed in memory and never persisted in plaintext. |
 | `ENABLE_STATS` | Optional: enable per-key usage tracking with SQLite (default: `false`) |
+| `ADMIN_TOKEN` | Required to use `/admin/*` endpoints. If unset, the admin API is disabled and returns 403. |
 
 All settings can also be provided via a config file (see below).
 
@@ -182,27 +183,43 @@ If no keys are configured, auth is disabled (backward compatible).
 
 ## Usage Statistics
 
-Enable with `ENABLE_STATS=true` to track per-key request counts and token usage in SQLite.
+Enable with `ENABLE_STATS=true` to track per-key request counts and token usage in SQLite. The DB stores only `sha256(key)` and a short `key_prefix` for display — plaintext keys are never persisted.
+
+### Admin API
+
+Every `/admin/*` route requires `ADMIN_TOKEN` and rejects the request otherwise. Send it either as an `X-Admin-Token` header or as `Authorization: Bearer <ADMIN_TOKEN>`.
 
 ```bash
-# View usage summary
-curl http://localhost:6655/admin/usage
+export ADMIN=$ADMIN_TOKEN
 
-# Filter by key or time range
-curl "http://localhost:6655/admin/usage?key=sk-key1&days=7"
+# Create a key — the plaintext is returned EXACTLY ONCE, store it now.
+curl -X POST http://localhost:6655/admin/keys \
+     -H "X-Admin-Token: $ADMIN" -H "Content-Type: application/json" \
+     -d '{"name": "dev-team"}'
+# {"key":"sk-...","key_hash":"...","key_prefix":"sk-abcdefgh…","name":"dev-team",
+#  "warning":"Store this key now — it will not be shown again."}
 
-# Group by day
-curl "http://localhost:6655/admin/usage?group_by=day"
-curl "http://localhost:6655/admin/usage?group_by=day&days=7"
+# List keys — only masked prefixes are returned, never the raw key.
+curl -H "X-Admin-Token: $ADMIN" http://localhost:6655/admin/keys
 
-# Manage API keys via admin API
-curl -X POST http://localhost:6655/admin/keys -H "Content-Type: application/json" -d '{"name": "dev-team"}'
-curl http://localhost:6655/admin/keys
-curl -X DELETE http://localhost:6655/admin/keys/sk-xxx
+# Revoke a key — pass its key_hash (preferred) or the raw key (hashed locally).
+curl -X DELETE -H "X-Admin-Token: $ADMIN" \
+     http://localhost:6655/admin/keys/<key_hash-or-raw-key>
 
-# View deployment stats
+# Usage summary — filter by hash or (raw key, hashed server-side); by time range; group by day.
+curl -H "X-Admin-Token: $ADMIN" http://localhost:6655/admin/usage
+curl -H "X-Admin-Token: $ADMIN" "http://localhost:6655/admin/usage?key_hash=<hash>&days=7"
+curl -H "X-Admin-Token: $ADMIN" "http://localhost:6655/admin/usage?key=sk-key1&days=7"
+curl -H "X-Admin-Token: $ADMIN" "http://localhost:6655/admin/usage?group_by=day"
+
+# Public (no admin token) — deployment stats and health.
 curl http://localhost:6655/stats
+curl http://localhost:6655/health
 ```
+
+### Upgrading from a previous version
+
+Older proxy versions stored API keys and per-request logs in plaintext. On first boot, the proxy detects the old schema, rehashes every stored key into `key_hash` + `key_prefix`, drops the plaintext columns, and `VACUUM`s the DB so the old pages are reclaimed. **The plaintext of DB-managed keys is unrecoverable after this migration** — clients continue to work (they still send the same plaintext key; the proxy hashes it on each request), but the admin API can only display prefixes going forward. If you lost track of a key, revoke it via `DELETE /admin/keys/<key_hash>` and issue a new one.
 
 ## Build from Source
 

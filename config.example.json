@@ -20,5 +20,7 @@
   "sap_resource_group": "default",
   "verbose": false,
   "api_keys": ["sk-your-key-1", "sk-your-key-2"],
-  "enable_stats": false
+  "enable_stats": false,
+  "//admin_token": "Required to hit /admin/* endpoints. If unset, the admin API returns 403.",
+  "admin_token": ""
 }
