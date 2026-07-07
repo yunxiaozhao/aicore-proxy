@@ -56,6 +56,20 @@ def messages():
     if not isinstance(body, dict):
         return jsonify({"error": "Invalid JSON body"}), 400
 
+    # Snapshot the raw incoming body BEFORE adapt_body mutates it, so debug
+    # logs show exactly what the client sent (useful when isolating a 400).
+    if VERBOSE:
+        try:
+            raw_body_dump = json.dumps(body, ensure_ascii=False)
+        except Exception as _e:
+            raw_body_dump = f"<unserializable: {_e}>"
+        raw_client_headers = {k: v for k, v in request.headers.items()
+                              if k.lower() not in ("authorization", "x-api-key", "cookie")}
+        print(f"[proxy] === incoming request ===\n"
+              f"  client headers: {json.dumps(raw_client_headers, ensure_ascii=False)}\n"
+              f"  raw body keys: {list(body.keys())}\n"
+              f"  raw body: {raw_body_dump}", flush=True)
+
     body, is_stream, req_model = adapt_body(body)
     req_start = time.time()
 
@@ -68,9 +82,20 @@ def messages():
     if VERBOSE:
         msg_count = len(body.get("messages", []))
         tool_count = len(body.get("tools", []))
+        try:
+            adapted_body_dump = json.dumps(body, ensure_ascii=False)
+        except Exception as _e:
+            adapted_body_dump = f"<unserializable: {_e}>"
+        # Field-by-field dump so each top-level key is grep-able even when
+        # the full body is huge.
+        per_field = {k: json.dumps(v, ensure_ascii=False) for k, v in body.items()}
+        per_field_dump = "\n".join(f"    [{k}] = {v}" for k, v in per_field.items())
+        outbound_headers = {k: v for k, v in headers.items() if k.lower() != "authorization"}
         print(f"[proxy] >>> model={req_model!r}, stream={is_stream}, messages={msg_count}, tools={tool_count}, "
               f"body keys: {list(body.keys())}\n"
-              f"  messages: {json.dumps(body.get('messages', []), ensure_ascii=False)}", flush=True)
+              f"  outbound headers (Authorization redacted): {json.dumps(outbound_headers, ensure_ascii=False)}\n"
+              f"  adapted body: {adapted_body_dump}\n"
+              f"  adapted body per field:\n{per_field_dump}", flush=True)
 
     try:
         sap_resp, dep_id = forward_to_sap(headers, body, stream=is_stream, model_hint=req_model)
@@ -82,11 +107,24 @@ def messages():
         return jsonify({"error": f"Upstream SAP AI Core request failed: {e}"}), 502
 
     if VERBOSE:
-        print(f"[proxy] <<< status: {sap_resp.status_code}", flush=True)
+        try:
+            resp_headers_dump = json.dumps(dict(sap_resp.headers), ensure_ascii=False)
+        except Exception as _e:
+            resp_headers_dump = f"<unserializable: {_e}>"
+        print(f"[proxy] <<< status: {sap_resp.status_code}\n"
+              f"  response headers: {resp_headers_dump}", flush=True)
 
     if sap_resp.status_code != 200:
         error_body = sap_resp.content.decode("utf-8", errors="replace")
-        print(f"[proxy] <<< {sap_resp.status_code} error: {error_body[:2000]}", flush=True)
+        try:
+            resp_headers_dump = json.dumps(dict(sap_resp.headers), ensure_ascii=False)
+        except Exception as _e:
+            resp_headers_dump = f"<unserializable: {_e}>"
+        # Full error body (not truncated) + response headers — SAP/Bedrock
+        # sometimes puts the real error type in headers like x-amzn-errortype.
+        print(f"[proxy] <<< {sap_resp.status_code} error on deployment {dep_id}\n"
+              f"  response headers: {resp_headers_dump}\n"
+              f"  full error body: {error_body}", flush=True)
         release_deployment(dep_id)
         log_usage(client_key, dep_id, 0, 0, sap_resp.status_code, is_stream, int((time.time() - req_start) * 1000))
         return Response(sap_resp.content, status=sap_resp.status_code,

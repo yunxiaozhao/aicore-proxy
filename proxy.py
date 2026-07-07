@@ -211,10 +211,19 @@ def forward_to_sap(headers, body, stream, model_hint=None):
     subpath = "invoke-with-response-stream" if stream else "invoke"
     target_url = f"{AI_API_URL}/v2/inference/deployments/{deployment_id}/{subpath}"
     if VERBOSE:
-        print(f"[proxy] -> deployment: {deployment_id}", flush=True)
+        try:
+            body_size = len(json.dumps(body, ensure_ascii=False))
+        except Exception:
+            body_size = -1
+        print(f"[proxy] -> deployment: {deployment_id}\n"
+              f"  target URL: {target_url}\n"
+              f"  stream={stream}, model_hint={model_hint!r}, body size (chars)={body_size}",
+              flush=True)
     try:
         sap_resp = _api_session.post(target_url, headers=headers, json=body, stream=stream, timeout=300)
         if sap_resp.status_code == 401:
+            if VERBOSE:
+                print(f"[proxy] 401 from deployment {deployment_id}, refreshing token and retrying", flush=True)
             new_token = _fetch_token()
             headers["Authorization"] = f"Bearer {new_token}"
             sap_resp = _api_session.post(target_url, headers=headers, json=body, stream=stream, timeout=300)
@@ -310,19 +319,14 @@ def adapt_body(body):
     caller to use as a routing hint; SAP AI Core does not accept this field
     so it's removed from the body itself.
     """
-    # Bedrock requires the "bedrock-2023-05-31" anthropic_version; force it
-    # even if the client sent an Anthropic-native version like "2023-06-01"
-    body["anthropic_version"] = "bedrock-2023-05-31"
+    if "anthropic_version" not in body:
+        body["anthropic_version"] = "bedrock-2023-05-31"
 
     model = body.pop("model", None)
     is_stream = body.pop("stream", False)
     body.pop("context_management", None)
     body.pop("thinking", None)
     body.pop("output_config", None)
-    # `metadata` (e.g. {"user_id": "..."}) is Anthropic-native and not accepted
-    # by Bedrock; some Bedrock Claude models return a misleading
-    # "role 'system' is not supported on this model" error when it's present.
-    body.pop("metadata", None)
 
     for key in ("system", "messages", "tools"):
         if key in body:
