@@ -305,6 +305,41 @@ class TestInjectSSEEvents:
         output = b"".join(chunks).decode("utf-8")
         assert "event: message_stop" in output
 
+    def test_smooth_stream_splits_text_delta(self):
+        """When SMOOTH_STREAM is on, one text_delta is split into multiple
+        smaller content_block_delta events preserving index and total text."""
+        resp = self._make_mock_resp([
+            'data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"abcdefgh"}}',
+        ])
+        with patch.object(proxy, "SMOOTH_STREAM", True), \
+             patch.object(proxy, "SMOOTH_STREAM_CHARS", 2), \
+             patch.object(proxy, "SMOOTH_STREAM_DELAY_MS", 0):
+            chunks = list(proxy.inject_sse_events(resp, "dep-a"))
+        output = b"".join(chunks).decode("utf-8")
+        # 8 chars / 2 per delta = 4 emitted content_block_delta events.
+        assert output.count("event: content_block_delta") == 4
+        # Concatenating the emitted texts must equal the original.
+        import re
+        pieces = re.findall(r'"text":\s*"([^"]*)"', output)
+        assert "".join(pieces) == "abcdefgh"
+        # Each split retains the original index.
+        assert output.count('"index": 0') + output.count('"index":0') == 4
+
+    def test_smooth_stream_leaves_input_json_delta_intact(self):
+        """Tool-call JSON deltas must NEVER be split — partial JSON would
+        break the client's accumulator."""
+        payload = ('data: {"type":"content_block_delta","index":1,'
+                   '"delta":{"type":"input_json_delta","partial_json":"{\\"x\\":1}"}}')
+        resp = self._make_mock_resp([payload])
+        with patch.object(proxy, "SMOOTH_STREAM", True), \
+             patch.object(proxy, "SMOOTH_STREAM_CHARS", 2), \
+             patch.object(proxy, "SMOOTH_STREAM_DELAY_MS", 0):
+            chunks = list(proxy.inject_sse_events(resp, "dep-a"))
+        output = b"".join(chunks).decode("utf-8")
+        # Exactly one event emitted, with the JSON string intact.
+        assert output.count("event: content_block_delta") == 1
+        assert '"partial_json":"{\\"x\\":1}"' in output
+
     def test_accumulates_streaming_tokens(self):
         """SSE events should accumulate input/output token counts."""
         self._reset_active()

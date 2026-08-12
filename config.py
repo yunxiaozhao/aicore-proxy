@@ -135,6 +135,26 @@ else:
 RESOURCE_GROUP = _cfg("SAP_RESOURCE_GROUP", "sap_resource_group", "default")
 VERBOSE = str(_cfg("VERBOSE", "verbose", "false")).lower() in ("true", "1", "yes")
 ENABLE_STATS = str(_cfg("ENABLE_STATS", "enable_stats", "false")).lower() in ("true", "1", "yes")
+# Client-side pacing: SAP AI Core / Bedrock batches multiple tokens into each
+# content_block_delta (typically 3-6 chars per delta, ~30-70 ms apart), which
+# makes replies visually appear in chunks rather than streaming. When enabled,
+# text_delta events are split into smaller pieces before forwarding so the
+# stream reads more like the direct-Anthropic-API experience. Only text_delta
+# is split; input_json_delta (tool calls) and non-text events pass through
+# untouched. Token counts and usage stats are unaffected.
+SMOOTH_STREAM = str(_cfg("SMOOTH_STREAM", "smooth_stream", "true")).lower() in ("true", "1", "yes")
+# Chars per re-emitted delta. Smaller => more events, more typewriter-like.
+# 1-2 looks good; higher values approach passthrough.
+try:
+    SMOOTH_STREAM_CHARS = max(1, int(_cfg("SMOOTH_STREAM_CHARS", "smooth_stream_chars", "2")))
+except (TypeError, ValueError):
+    SMOOTH_STREAM_CHARS = 2
+# Delay between re-emitted deltas, in milliseconds. 10-20ms works well.
+# 0 disables the pacing but still splits (bursts everything at once).
+try:
+    SMOOTH_STREAM_DELAY_MS = max(0, int(_cfg("SMOOTH_STREAM_DELAY_MS", "smooth_stream_delay_ms", "15")))
+except (TypeError, ValueError):
+    SMOOTH_STREAM_DELAY_MS = 15
 # Admin API token — required to hit /admin/*. If unset, admin routes return 403.
 ADMIN_TOKEN = _cfg("ADMIN_TOKEN", "admin_token", "") or ""
 

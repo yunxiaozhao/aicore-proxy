@@ -25,6 +25,7 @@ from config import (
     CLIENT_ID, CLIENT_SECRET, AUTH_URL, AI_API_URL,
     DEPLOYMENT_IDS, DEPLOYMENT_IDS_BY_MODEL, MODEL_KEYWORDS,
     RESOURCE_GROUP, VERBOSE, ENABLE_STATS,
+    SMOOTH_STREAM, SMOOTH_STREAM_CHARS, SMOOTH_STREAM_DELAY_MS,
     log_usage,
 )
 
@@ -258,10 +259,22 @@ def inject_sse_events(sap_resp, deployment_id, client_key="", req_start=None):
     input_tokens = 0
     output_tokens = 0
     buffer = b""
+    delay_s = SMOOTH_STREAM_DELAY_MS / 1000.0
+
+    def _format_event(event_type, payload):
+        """Serialize one SSE event to Anthropic-format bytes."""
+        line = "data: " + json.dumps(payload, ensure_ascii=False)
+        if event_type:
+            return f"event: {event_type}\n{line}\n\n".encode("utf-8")
+        return f"{line}\n\n".encode("utf-8")
 
     def _process_event_block(block_bytes):
-        """Parse one SSE event block (bytes between blank lines) and yield the
-        re-formatted bytes. Also updates the token counters via closure."""
+        """Parse one SSE event block and yield one or more re-formatted event
+        bytestrings. Most events yield exactly one output; text_delta events
+        may be split into smaller pieces when SMOOTH_STREAM is on.
+
+        Runs as a generator so token accounting (via nonlocal) still happens
+        exactly once per upstream event, regardless of splitting."""
         nonlocal input_tokens, output_tokens
         block = block_bytes.decode("utf-8", errors="replace")
         # An event block may contain multiple lines: `event:`, `data:`, comments.
@@ -276,21 +289,51 @@ def inject_sse_events(sap_resp, deployment_id, client_key="", req_start=None):
                 break
         if data_line is None:
             # Pass through as-is (comments, keep-alives).
-            return (block.rstrip("\n") + "\n\n").encode("utf-8")
+            yield (block.rstrip("\n") + "\n\n").encode("utf-8")
+            return
         try:
             payload = json.loads(data_line[6:])
             event_type = payload.get("type", "")
         except (json.JSONDecodeError, ValueError):
+            payload = None
             event_type = ""
+
         if event_type == "message_start":
             usage = payload.get("message", {}).get("usage", {})
             input_tokens += usage.get("input_tokens", 0)
         elif event_type == "message_delta":
             usage = payload.get("usage", {})
             output_tokens += usage.get("output_tokens", 0)
+
+        # Smooth-stream: split large text_delta events into smaller pieces so
+        # the reader sees a typewriter-style trickle instead of Bedrock's
+        # 3-6 char bursts. Only text_delta is safe to split; input_json_delta
+        # (tool calls) must arrive intact or the client's JSON accumulator
+        # sees invalid partial JSON.
+        if (SMOOTH_STREAM and payload is not None
+                and event_type == "content_block_delta"
+                and isinstance(payload.get("delta"), dict)
+                and payload["delta"].get("type") == "text_delta"):
+            text = payload["delta"].get("text", "")
+            if len(text) > SMOOTH_STREAM_CHARS:
+                idx = payload.get("index", 0)
+                first = True
+                for i in range(0, len(text), SMOOTH_STREAM_CHARS):
+                    piece = text[i:i + SMOOTH_STREAM_CHARS]
+                    if not first and delay_s > 0:
+                        time.sleep(delay_s)
+                    first = False
+                    yield _format_event("content_block_delta", {
+                        "type": "content_block_delta",
+                        "index": idx,
+                        "delta": {"type": "text_delta", "text": piece},
+                    })
+                return
+
         if event_type:
-            return f"event: {event_type}\n{data_line}\n\n".encode("utf-8")
-        return f"{data_line}\n\n".encode("utf-8")
+            yield f"event: {event_type}\n{data_line}\n\n".encode("utf-8")
+        else:
+            yield f"{data_line}\n\n".encode("utf-8")
 
     try:
         # chunk_size=None -> yield as soon as bytes arrive from the socket.
@@ -312,10 +355,10 @@ def inject_sse_events(sap_resp, deployment_id, client_key="", req_start=None):
                     event_bytes = buffer[:idx]
                     buffer = buffer[idx + 2:]
                 if event_bytes.strip():
-                    yield _process_event_block(event_bytes)
+                    yield from _process_event_block(event_bytes)
         # Flush anything left over (last event without trailing blank line).
         if buffer.strip():
-            yield _process_event_block(buffer)
+            yield from _process_event_block(buffer)
     except req_lib.exceptions.ChunkedEncodingError as e:
         print(f"[proxy] Upstream stream ended prematurely (ChunkedEncodingError): {e}", flush=True)
         err_payload = json.dumps({
