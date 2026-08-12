@@ -142,7 +142,7 @@ ENABLE_STATS = str(_cfg("ENABLE_STATS", "enable_stats", "false")).lower() in ("t
 # stream reads more like the direct-Anthropic-API experience. Only text_delta
 # is split; input_json_delta (tool calls) and non-text events pass through
 # untouched. Token counts and usage stats are unaffected.
-SMOOTH_STREAM = str(_cfg("SMOOTH_STREAM", "smooth_stream", "true")).lower() in ("true", "1", "yes")
+SMOOTH_STREAM = str(_cfg("SMOOTH_STREAM", "smooth_stream", "false")).lower() in ("true", "1", "yes")
 # Chars per re-emitted delta. Smaller => more events, more typewriter-like.
 # 1-2 looks good; higher values approach passthrough.
 try:
