@@ -216,7 +216,10 @@ class TestAdaptBody:
 class TestInjectSSEEvents:
     def _make_mock_resp(self, lines):
         resp = MagicMock()
-        resp.iter_lines.return_value = [line.encode("utf-8") for line in lines]
+        # inject_sse_events now uses iter_content with SSE "\n\n" event
+        # boundaries — feed one full event (line + blank line) per chunk.
+        chunks = [(line + "\n\n").encode("utf-8") for line in lines]
+        resp.iter_content.return_value = chunks
         return resp
 
     def _reset_active(self):
@@ -265,12 +268,42 @@ class TestInjectSSEEvents:
         with proxy._deployment_lock:
             proxy._deployment_active["dep-b"] = 1
         resp = MagicMock()
-        resp.iter_lines.side_effect = Exception("connection lost")
+        resp.iter_content.side_effect = Exception("connection lost")
         try:
             list(proxy.inject_sse_events(resp, "dep-b"))
         except Exception:
             pass
         assert proxy._deployment_active["dep-b"] == 0
+
+    def test_flushes_event_split_across_chunks(self):
+        """Bytes belonging to one event can arrive in multiple socket chunks;
+        the event must still be emitted as a single, complete SSE block."""
+        resp = MagicMock()
+        # One logical event split into 3 raw byte chunks (mid-JSON and
+        # straddling the "\n\n" boundary).
+        resp.iter_content.return_value = [
+            b'data: {"type":"content_block_delta"',
+            b',"delta":{"text":"hello"}}',
+            b'\n\ndata: {"type":"message_stop"}\n\n',
+        ]
+        chunks = list(proxy.inject_sse_events(resp, "dep-a"))
+        output = b"".join(chunks).decode("utf-8")
+        # Both events must be present, in order, each with its event: header.
+        first = output.index("event: content_block_delta")
+        second = output.index("event: message_stop")
+        assert first < second
+        assert '"text":"hello"' in output
+
+    def test_flushes_trailing_event_without_blank_line(self):
+        """If upstream closes without a final blank line, the last buffered
+        event must still be flushed rather than silently dropped."""
+        resp = MagicMock()
+        resp.iter_content.return_value = [
+            b'data: {"type":"message_stop"}',   # note: no trailing \n\n
+        ]
+        chunks = list(proxy.inject_sse_events(resp, "dep-a"))
+        output = b"".join(chunks).decode("utf-8")
+        assert "event: message_stop" in output
 
     def test_accumulates_streaming_tokens(self):
         """SSE events should accumulate input/output token counts."""

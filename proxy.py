@@ -247,31 +247,75 @@ def inject_sse_events(sap_resp, deployment_id, client_key="", req_start=None):
 
     SAP returns:   data: {"type":"message_start",...}\\n\\n
     Anthropic:     event: message_start\\ndata: {"type":"message_start",...}\\n\\n
+
+    Uses raw byte streaming (iter_content) rather than iter_lines() because:
+    - iter_lines() buffers until a newline lands, and won't flush the LAST
+      event until the upstream connection closes -> Claude Code sees the
+      whole reply arrive at once instead of token-by-token.
+    - Multi-byte UTF-8 characters (e.g. CJK) that straddle a chunk boundary
+      can also stall iter_lines() until more bytes arrive.
     """
     input_tokens = 0
     output_tokens = 0
-    try:
-        for raw_line in sap_resp.iter_lines():
-            line = raw_line.decode("utf-8", errors="replace") if isinstance(raw_line, bytes) else raw_line
+    buffer = b""
+
+    def _process_event_block(block_bytes):
+        """Parse one SSE event block (bytes between blank lines) and yield the
+        re-formatted bytes. Also updates the token counters via closure."""
+        nonlocal input_tokens, output_tokens
+        block = block_bytes.decode("utf-8", errors="replace")
+        # An event block may contain multiple lines: `event:`, `data:`, comments.
+        # We only care about `data:` lines from upstream (SAP omits `event:`).
+        data_line = None
+        for line in block.split("\n"):
             if line.startswith("data: "):
-                try:
-                    payload = json.loads(line[6:])
-                    event_type = payload.get("type", "")
-                except (json.JSONDecodeError, ValueError):
-                    payload = {}
-                    event_type = ""
-                if event_type == "message_start":
-                    usage = payload.get("message", {}).get("usage", {})
-                    input_tokens += usage.get("input_tokens", 0)
-                elif event_type == "message_delta":
-                    usage = payload.get("usage", {})
-                    output_tokens += usage.get("output_tokens", 0)
-                if event_type:
-                    yield f"event: {event_type}\n{line}\n\n".encode("utf-8")
+                data_line = line
+                break
+            if line.startswith("data:"):
+                data_line = "data: " + line[5:].lstrip()
+                break
+        if data_line is None:
+            # Pass through as-is (comments, keep-alives).
+            return (block.rstrip("\n") + "\n\n").encode("utf-8")
+        try:
+            payload = json.loads(data_line[6:])
+            event_type = payload.get("type", "")
+        except (json.JSONDecodeError, ValueError):
+            event_type = ""
+        if event_type == "message_start":
+            usage = payload.get("message", {}).get("usage", {})
+            input_tokens += usage.get("input_tokens", 0)
+        elif event_type == "message_delta":
+            usage = payload.get("usage", {})
+            output_tokens += usage.get("output_tokens", 0)
+        if event_type:
+            return f"event: {event_type}\n{data_line}\n\n".encode("utf-8")
+        return f"{data_line}\n\n".encode("utf-8")
+
+    try:
+        # chunk_size=None -> yield as soon as bytes arrive from the socket.
+        for chunk in sap_resp.iter_content(chunk_size=None):
+            if not chunk:
+                continue
+            buffer += chunk
+            # SSE events are separated by a blank line: "\n\n" (or "\r\n\r\n").
+            # Split off every complete event currently in the buffer and flush.
+            while True:
+                idx = buffer.find(b"\n\n")
+                idx_rn = buffer.find(b"\r\n\r\n")
+                if idx == -1 and idx_rn == -1:
+                    break
+                if idx == -1 or (idx_rn != -1 and idx_rn < idx):
+                    event_bytes = buffer[:idx_rn]
+                    buffer = buffer[idx_rn + 4:]
                 else:
-                    yield f"{line}\n\n".encode("utf-8")
-            elif line.strip():
-                yield f"{line}\n".encode("utf-8")
+                    event_bytes = buffer[:idx]
+                    buffer = buffer[idx + 2:]
+                if event_bytes.strip():
+                    yield _process_event_block(event_bytes)
+        # Flush anything left over (last event without trailing blank line).
+        if buffer.strip():
+            yield _process_event_block(buffer)
     except req_lib.exceptions.ChunkedEncodingError as e:
         print(f"[proxy] Upstream stream ended prematurely (ChunkedEncodingError): {e}", flush=True)
         err_payload = json.dumps({
