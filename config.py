@@ -187,10 +187,23 @@ _api_keys_last_refresh = 0
 
 
 def hash_key(key):
-    """Return the sha256 hex digest of an API key. Empty/None → ''."""
+    """Return a deterministic PBKDF2-HMAC-SHA256 hex digest of an API key.
+
+    API keys are sensitive secrets, so use a computationally expensive KDF
+    rather than a fast hash. A fixed application salt is used to preserve
+    deterministic lookups across process restarts and key sources.
+    Empty/None → ''.
+    """
     if not key:
         return ""
-    return hashlib.sha256(key.encode("utf-8")).hexdigest()
+    dk = hashlib.pbkdf2_hmac(
+        "sha256",
+        key.encode("utf-8"),
+        b"aicore-proxy/api-key",
+        600_000,
+        dklen=32,
+    )
+    return dk.hex()
 
 
 def key_prefix(key):
