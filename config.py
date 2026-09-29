@@ -187,22 +187,23 @@ _api_keys_last_refresh = 0
 
 
 def hash_key(key):
-    """Return a keyed BLAKE2b hex digest of an API key. Empty/None → ''.
+    """Return a deterministic PBKDF2-HMAC-SHA256 hex digest of an API key.
 
-    BLAKE2b is a cryptographic hash designed as a SHA-3 alternative; using it
-    with a fixed application key (``digest_size=32``) gives a deterministic
-    64-hex-char digest that CodeQL does not flag as weak for sensitive-data
-    hashing. The key material is a hard-coded application salt: it exists to
-    domain-separate this hash from a plain BLAKE2b, not to protect against an
-    attacker who has read access to the source code.
+    API keys are sensitive secrets, so use a computationally expensive KDF
+    rather than a fast hash. A fixed application salt is used to preserve
+    deterministic lookups across process restarts and key sources.
+    Empty/None → ''.
     """
     if not key:
         return ""
-    return hashlib.blake2b(
+    dk = hashlib.pbkdf2_hmac(
+        "sha256",
         key.encode("utf-8"),
-        digest_size=32,
-        key=b"aicore-proxy/api-key",
-    ).hexdigest()
+        b"aicore-proxy/api-key",
+        600_000,
+        dklen=32,
+    )
+    return dk.hex()
 
 
 def key_prefix(key):
