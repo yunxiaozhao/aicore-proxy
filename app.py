@@ -2,13 +2,17 @@
 Flask application — all HTTP route handlers for aicore-proxy.
 
 Routes:
-  POST /v1/messages  — main proxy endpoint (Anthropic Messages API)
-  GET  /health       — health check
-  GET  /stats        — deployment active connections + global counters
-  GET  /admin/keys   — list API keys
-  POST /admin/keys   — create API key
-  DELETE /admin/keys/<key> — delete API key
-  GET  /admin/usage  — usage summary
+  POST /v1/messages              — main proxy endpoint (Anthropic Messages API)
+  POST /v1/messages/count_tokens — pre-flight token count (Anthropic Token Count API)
+  GET  /v1/models                — list advertised models (Anthropic-format catalog)
+  GET  /v1/models/<id>           — fetch one model entry
+  GET  /health                   — health check (auth + upstream token + deployments)
+  GET  /stats                    — deployment active connections + global counters
+  GET  /admin/keys               — list API keys
+  POST /admin/keys               — create API key
+  DELETE /admin/keys/<key>       — delete API key
+  GET  /admin/usage              — usage summary
+  POST /admin/models/refresh     — force-refetch the SAP-derived model catalog
 """
 
 import json
@@ -31,22 +35,46 @@ from proxy import (
     get_token, get_token_status, get_deployment_active,
     forward_to_sap, release_deployment, inject_sse_events, adapt_body,
 )
+from models import get_models, get_model, paginate, refresh_now, get_cache_status
 
 
 app = Flask(__name__)
+
+
+def _extract_client_key():
+    """Pull the client API key from `x-api-key` or `Authorization: Bearer …`."""
+    key = request.headers.get("x-api-key") or ""
+    if not key:
+        auth_header = request.headers.get("Authorization", "")
+        if auth_header.startswith("Bearer "):
+            key = auth_header[7:].strip()
+    return key
+
+
+def _require_client_auth():
+    """Return an (error_response, status) tuple if auth fails, else None.
+
+    Matches the behavior of the /v1/messages endpoint so all public /v1/* routes
+    share the same key check.
+    """
+    if not auth_enabled():
+        return None
+    if not validate_api_key(_extract_client_key()):
+        return jsonify({
+            "type": "error",
+            "error": {"type": "authentication_error", "message": "Invalid API key"},
+        }), 401
+    return None
 
 
 @app.route("/v1/messages", methods=["POST"])
 def messages():
     """Main proxy endpoint: receive Anthropic Messages API requests, forward to SAP AI Core."""
     # --- API key authentication ---
-    client_key = request.headers.get("x-api-key") or ""
-    if not client_key:
-        auth_header = request.headers.get("Authorization", "")
-        if auth_header.startswith("Bearer "):
-            client_key = auth_header[7:].strip()
-    if auth_enabled() and not validate_api_key(client_key):
-        return jsonify({"type": "error", "error": {"type": "authentication_error", "message": "Invalid API key"}}), 401
+    auth_err = _require_client_auth()
+    if auth_err:
+        return auth_err
+    client_key = _extract_client_key()
 
     token = get_token()
     if not token:
@@ -103,8 +131,9 @@ def messages():
         log_usage(client_key, None, 0, 0, 504, is_stream, int((time.time() - req_start) * 1000))
         return jsonify({"error": "Upstream SAP AI Core timeout"}), 504
     except req_lib.RequestException as e:
+        print(f"[proxy] Upstream request failed: {e!r}", flush=True)
         log_usage(client_key, None, 0, 0, 502, is_stream, int((time.time() - req_start) * 1000))
-        return jsonify({"error": f"Upstream SAP AI Core request failed: {e}"}), 502
+        return jsonify({"error": "Upstream SAP AI Core request failed"}), 502
 
     if VERBOSE:
         try:
@@ -156,9 +185,10 @@ def messages():
                     log_usage(client_key, dep_id, 0, 0, 504, False, int((time.time() - req_start) * 1000))
                     return jsonify({"error": "Upstream SAP AI Core timeout on retry"}), 504
                 except req_lib.RequestException as e2:
+                    print(f"[proxy] Upstream retry failed: {e2!r}", flush=True)
                     release_deployment(dep_id)
                     log_usage(client_key, dep_id, 0, 0, 502, False, int((time.time() - req_start) * 1000))
-                    return jsonify({"error": f"Upstream retry failed: {e2}"}), 502
+                    return jsonify({"error": "Upstream retry failed"}), 502
                 release_deployment(dep_id)
                 dep_id = dep_id2
                 if sap_resp.status_code != 200:
@@ -188,9 +218,156 @@ def messages():
                     content_type=sap_resp.headers.get("Content-Type", "application/json"))
 
 
+# ---------------------------------------------------------------------------
+# Anthropic-style Models API — advertises which model names this proxy accepts
+# in the `model` field of /v1/messages. Purely informational: actual upstream
+# routing is decided by DEPLOYMENT_IDS / DEPLOYMENT_IDS_BY_MODEL, not by which
+# entries are listed here. Response shape mirrors Anthropic's own /v1/models
+# (see https://platform.claude.com/docs/en/api/models/list).
+# ---------------------------------------------------------------------------
+
+@app.route("/v1/models", methods=["GET"])
+def list_models():
+    """List available models. Supports ?after_id, ?before_id, ?limit like Anthropic."""
+    auth_err = _require_client_auth()
+    if auth_err:
+        return auth_err
+    after_id = request.args.get("after_id")
+    before_id = request.args.get("before_id")
+    limit = request.args.get("limit", 20, type=int)
+    page, has_more, first_id, last_id = paginate(
+        get_models(), after_id=after_id, before_id=before_id, limit=limit
+    )
+    return jsonify({
+        "data": page,
+        "has_more": has_more,
+        "first_id": first_id,
+        "last_id": last_id,
+    })
+
+
+@app.route("/v1/models/<model_id>", methods=["GET"])
+def get_model_route(model_id):
+    """Fetch one model entry by id. 404 if not in the catalog."""
+    auth_err = _require_client_auth()
+    if auth_err:
+        return auth_err
+    m = get_model(model_id)
+    if m is None:
+        return jsonify({
+            "type": "error",
+            "error": {"type": "not_found_error", "message": f"model '{model_id}' not found"},
+        }), 404
+    return jsonify(m)
+
+
+# ---------------------------------------------------------------------------
+# Token Count API — POST /v1/messages/count_tokens
+#
+# Anthropic's own count_tokens endpoint counts input tokens WITHOUT generating
+# any output, so clients can size prompts before spending on a real call. SAP
+# AI Core / Bedrock does not expose a native pre-invocation counter — usage is
+# only reported in a real response's `usage` field. We reproduce the API's
+# semantics by issuing a `max_tokens=1` upstream call, reading `usage.input_tokens`
+# from the reply, and returning it in the standard shape.
+#
+# Cost note: this costs 1 output token per call. Cheap, but not free —
+# something clients need to know if they hammer it. Documented in the README.
+#
+# Request body mirrors /v1/messages (messages / system / tools / model).
+# `stream`, `max_tokens`, `temperature` etc. are ignored — count_tokens has no
+# generation semantics.
+# ---------------------------------------------------------------------------
+
+@app.route("/v1/messages/count_tokens", methods=["POST"])
+def count_tokens():
+    """Anthropic Token Count API — returns {"input_tokens": <n>} for the prompt."""
+    auth_err = _require_client_auth()
+    if auth_err:
+        return auth_err
+    client_key = _extract_client_key()
+
+    token = get_token()
+    if not token:
+        return jsonify({"error": "No SAP token available yet, try again shortly"}), 503
+
+    body = request.get_json(silent=True)
+    if not isinstance(body, dict):
+        return jsonify({
+            "type": "error",
+            "error": {"type": "invalid_request_error", "message": "Invalid JSON body"},
+        }), 400
+
+    if VERBOSE:
+        try:
+            raw = json.dumps(body, ensure_ascii=False)
+        except Exception:
+            raw = "<unserializable>"
+        print(f"[proxy] count_tokens request: {raw}", flush=True)
+
+    # Reuse the same body adapter so field stripping / system-role merging /
+    # cache_control removal all match /v1/messages behavior. Then coerce to a
+    # minimal probe: max_tokens=1, no streaming.
+    body, _ignored_stream, req_model = adapt_body(body)
+    body["max_tokens"] = 1
+    # Some Anthropic examples pass a `thinking` block to count_tokens; adapt_body
+    # already strips it (SAP rejects it), so no extra work here.
+
+    req_start = time.time()
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "ai-resource-group": RESOURCE_GROUP,
+        "Content-Type": "application/json",
+    }
+
+    try:
+        sap_resp, dep_id = forward_to_sap(headers, body, stream=False, model_hint=req_model)
+    except req_lib.Timeout:
+        log_usage(client_key, None, 0, 0, 504, False, int((time.time() - req_start) * 1000))
+        return jsonify({"error": "Upstream SAP AI Core timeout"}), 504
+    except req_lib.RequestException as e:
+        print(f"[proxy] Upstream request failed: {e!r}", flush=True)
+        log_usage(client_key, None, 0, 0, 502, False, int((time.time() - req_start) * 1000))
+        return jsonify({"error": "Upstream SAP AI Core request failed"}), 502
+
+    try:
+        content = sap_resp.content
+    finally:
+        release_deployment(dep_id)
+
+    if sap_resp.status_code != 200:
+        # Forward the upstream error verbatim so clients see the real cause.
+        log_usage(client_key, dep_id, 0, 0, sap_resp.status_code, False,
+                  int((time.time() - req_start) * 1000))
+        return Response(content, status=sap_resp.status_code,
+                        content_type=sap_resp.headers.get("Content-Type", "application/json"))
+
+    try:
+        resp_data = json.loads(content)
+        usage = resp_data.get("usage", {}) or {}
+        input_tokens = int(usage.get("input_tokens", 0))
+        output_tokens = int(usage.get("output_tokens", 0))
+    except (json.JSONDecodeError, TypeError, ValueError):
+        input_tokens = output_tokens = 0
+
+    # Log the probe as its own request so /admin/usage doesn't lose the cost.
+    log_usage(client_key, dep_id, input_tokens, output_tokens, 200, False,
+              int((time.time() - req_start) * 1000))
+
+    if VERBOSE:
+        print(f"[proxy] count_tokens result: input_tokens={input_tokens} "
+              f"(paid 1 output token on deployment {dep_id})", flush=True)
+
+    return jsonify({"input_tokens": input_tokens})
+
+
 @app.route("/health", methods=["GET"])
 def health():
-    """Health check endpoint. Returns token status for Docker healthcheck and monitoring."""
+    """Health check endpoint. Returns token status for Docker healthcheck and monitoring.
+
+    Add `?verbose=1` for extra diagnostic fields: per-deployment active-connection
+    counts, resource group, and the /v1/models cache state (source: sap|fallback|none).
+    """
     has_token, token_error = get_token_status()
     result = {
         "status": "ok",
@@ -210,6 +387,12 @@ def health():
             result["total_output_tokens"] = row[0][2]
         except Exception:
             pass
+    if request.args.get("verbose") in ("1", "true", "yes"):
+        result["deployments_active"] = get_deployment_active()
+        result["resource_group"] = RESOURCE_GROUP
+        # Model-catalog cache: source (sap|fallback|none), count, last_error.
+        # Does NOT force a refresh — reports whatever is currently cached.
+        result["models_cache"] = get_cache_status()
     return jsonify(result)
 
 
@@ -381,6 +564,28 @@ def admin_usage():
         "input_tokens": r[3], "output_tokens": r[4],
         "avg_duration_ms": round(r[5]),
     } for r in rows])
+
+
+@app.route("/admin/models/refresh", methods=["POST"])
+@require_admin
+def admin_refresh_models():
+    """Force a bypass-TTL refresh of the SAP-derived model catalog.
+
+    Handy right after adding or retiring a deployment in SAP AI Core so
+    /v1/models reflects the change without waiting for the TTL to expire.
+    """
+    try:
+        models = refresh_now()
+        return jsonify({
+            "refreshed": True,
+            "count": len(models),
+            "cache": get_cache_status(),
+        })
+    except Exception:
+        # refresh_now() itself swallows fetch errors and keeps the old cache,
+        # but leave a guard in case a future change starts raising.
+        app.logger.exception("admin_refresh_models failed")
+        return jsonify({"refreshed": False, "error": "Model refresh failed"}), 502
 
 
 if __name__ == "__main__":

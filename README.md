@@ -30,6 +30,8 @@ SAP AI Core (Claude model)
 - **Usage statistics** — optional per-key request and token usage tracking with SQLite (enable via `ENABLE_STATS=true`); the log stores only the key's hash and display prefix, not the raw key
 - **Admin API** — manage API keys and query usage stats via REST endpoints (requires `ENABLE_STATS=true` **and** a configured `ADMIN_TOKEN`)
 - **Health check & stats endpoints** — `GET /health` for Docker healthcheck, `GET /stats` for deployment active connections
+- **Live models catalog** — `GET /v1/models` and `GET /v1/models/{id}` return the same shape as Anthropic's own Models API (with cursor pagination). The list is built by calling SAP AI Core's `GET /v2/lm/deployments` and reading each RUNNING deployment's `details.resources.backend_details.model` — no hard-coded catalog. Results are cached for 60s (tunable via `MODELS_CACHE_TTL`)
+- **Token counting** — `POST /v1/messages/count_tokens` implements Anthropic's standard [Token Count API](https://platform.claude.com/docs/en/api/messages/count_tokens) shape (`{"input_tokens": <n>}`). SAP has no native pre-invocation counter, so each call issues a `max_tokens=1` upstream probe (cost: 1 output token per call)
 
 ## Quick Start
 
@@ -166,6 +168,42 @@ with client.messages.stream(
         print(text, end="", flush=True)
 ```
 
+## Additional Anthropic API endpoints
+
+Beyond `/v1/messages`, two more standard Anthropic endpoints are proxied so existing clients and SDKs work without special-casing this proxy. Both are auth-gated the same way as `/v1/messages` — if `API_KEYS` is set, missing/invalid keys return `401` with the same `{"type":"error","error":{...}}` shape.
+
+### `GET /v1/models` — list available models
+
+Lists the models this proxy can actually reach, built by calling SAP AI Core's `GET /v2/lm/deployments` and extracting `details.resources.backend_details.model.{name,version}` from each **RUNNING** deployment. Non-running deployments are skipped; duplicates (same model in multiple deployments) collapse to a single entry with the newest `createdAt`.
+
+The response mirrors the [Anthropic Models API](https://platform.claude.com/docs/en/api/models/list): `data[]` entries with `type/id/display_name/created_at/max_input_tokens/max_tokens/capabilities`, plus `first_id`, `last_id`, `has_more`. Supports `?limit=1..1000` (default 20) and `?after_id` / `?before_id` cursor pagination. Use `GET /v1/models/<model_id>` to fetch one entry (404 if not deployed).
+
+```bash
+curl http://localhost:6655/v1/models -H "x-api-key: $KEY"
+curl http://localhost:6655/v1/models/claude-opus-5-5 -H "x-api-key: $KEY"
+```
+
+**Naming**: SAP model names like `anthropic--claude-opus-5-5` are normalized to the public Anthropic IDs (`claude-opus-5-5`) so clients can send them straight into `/v1/messages` without transformation. When SAP reports a pinned `version`, it's appended as a suffix (`claude-haiku-4-5-20251001`); `version: "latest"` is ignored.
+
+**Caching**: results are cached for 60s to avoid hammering the deployments endpoint. Tune with `MODELS_CACHE_TTL=<seconds>`. To force a refetch right after adding or removing a deployment in SAP, call `POST /admin/models/refresh` (see [Admin API](#admin-api)).
+
+**Fallback**: if the SAP fetch fails on a cold cache, the proxy serves a small built-in list of well-known Claude IDs so `/v1/models` still works during an upstream outage. Set `MODELS_STATIC_FALLBACK=false` to make failures visible (returns an empty list instead). `GET /health?verbose=1` includes a `models_cache` block showing `source: "sap"` vs `"fallback"` and the last error, if any.
+
+### `POST /v1/messages/count_tokens` — pre-flight token counting
+
+Standard [Anthropic Token Count API](https://platform.claude.com/docs/en/api/messages/count_tokens) — accepts the same request shape as `/v1/messages` (`messages`, `system`, `tools`, `model`) and returns `{"input_tokens": <n>}` for how many input tokens the prompt would use.
+
+```bash
+curl -X POST http://localhost:6655/v1/messages/count_tokens \
+     -H "x-api-key: $KEY" -H "Content-Type: application/json" \
+     -d '{"model":"claude-opus-5-5","messages":[{"role":"user","content":"Hello, world"}]}'
+# {"input_tokens": 12}
+```
+
+**Implementation note**: SAP AI Core / Bedrock does not expose a native pre-invocation token counter. The proxy issues a `max_tokens=1` upstream call and reads `usage.input_tokens` from the response, so **each `count_tokens` call costs 1 output token** on the underlying deployment. That's cheap (typically <$0.0001) but not free — usage is logged the same as a regular `/v1/messages` call so it shows up in `/admin/usage`.
+
+Client-supplied `max_tokens`, `stream`, `temperature`, etc. are ignored: count_tokens has no generation semantics. Upstream errors (invalid `model`, tool schema issues, etc.) are surfaced verbatim with their original status code, so a 400 here means the same request would 400 against `/v1/messages` too — handy for validating a prompt before spending on a real call.
+
 ## API Key Authentication
 
 When `API_KEYS` is set (env var or config file), clients must provide a valid key:
@@ -211,6 +249,10 @@ curl -H "X-Admin-Token: $ADMIN" http://localhost:6655/admin/usage
 curl -H "X-Admin-Token: $ADMIN" "http://localhost:6655/admin/usage?key_hash=<hash>&days=7"
 curl -H "X-Admin-Token: $ADMIN" "http://localhost:6655/admin/usage?key=sk-key1&days=7"
 curl -H "X-Admin-Token: $ADMIN" "http://localhost:6655/admin/usage?group_by=day"
+
+# Force-refetch the /v1/models catalog from SAP (bypasses the 60s TTL cache).
+# Useful right after adding or removing a deployment in SAP AI Core.
+curl -X POST -H "X-Admin-Token: $ADMIN" http://localhost:6655/admin/models/refresh
 
 # Public (no admin token) — deployment stats and health.
 curl http://localhost:6655/stats
