@@ -581,10 +581,11 @@ def admin_refresh_models():
             "count": len(models),
             "cache": get_cache_status(),
         })
-    except Exception as e:
+    except Exception:
         # refresh_now() itself swallows fetch errors and keeps the old cache,
         # but leave a guard in case a future change starts raising.
-        return jsonify({"refreshed": False, "error": str(e)}), 502
+        app.logger.exception("admin_refresh_models failed")
+        return jsonify({"refreshed": False, "error": "Model refresh failed"}), 502
 
 
 if __name__ == "__main__":
