@@ -103,8 +103,9 @@ def messages():
         log_usage(client_key, None, 0, 0, 504, is_stream, int((time.time() - req_start) * 1000))
         return jsonify({"error": "Upstream SAP AI Core timeout"}), 504
     except req_lib.RequestException as e:
+        print(f"[proxy] Upstream request failed: {e!r}", flush=True)
         log_usage(client_key, None, 0, 0, 502, is_stream, int((time.time() - req_start) * 1000))
-        return jsonify({"error": f"Upstream SAP AI Core request failed: {e}"}), 502
+        return jsonify({"error": "Upstream SAP AI Core request failed"}), 502
 
     if VERBOSE:
         try:
@@ -156,9 +157,10 @@ def messages():
                     log_usage(client_key, dep_id, 0, 0, 504, False, int((time.time() - req_start) * 1000))
                     return jsonify({"error": "Upstream SAP AI Core timeout on retry"}), 504
                 except req_lib.RequestException as e2:
+                    print(f"[proxy] Upstream retry failed: {e2!r}", flush=True)
                     release_deployment(dep_id)
                     log_usage(client_key, dep_id, 0, 0, 502, False, int((time.time() - req_start) * 1000))
-                    return jsonify({"error": f"Upstream retry failed: {e2}"}), 502
+                    return jsonify({"error": "Upstream retry failed"}), 502
                 release_deployment(dep_id)
                 dep_id = dep_id2
                 if sap_resp.status_code != 200:
